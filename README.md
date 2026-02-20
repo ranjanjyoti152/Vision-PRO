@@ -270,7 +270,7 @@ Phase 2 ████████████████████ 100%  Camer
 Phase 3 ████████████████████ 100%  AI Detection
 Phase 4 ████████████████████ 100%  Face Recognition
 Phase 5 ████████████████████ 100%  Notifications & LLM
-Phase 6 ░░░░░░░░░░░░░░░░░░░░   0%  Analytics & Heatmaps
+Phase 6 ████████████████████ 100%  Analytics & Heatmaps
 Phase 7 ░░░░░░░░░░░░░░░░░░░░   0%  Production Hardening
 ```
 
@@ -331,14 +331,15 @@ Phase 7 ░░░░░░░░░░░░░░░░░░░░   0%  Produ
 | LLM AI Assistant | ✅ Done | GPT/Gemini/Ollama/OpenRouter interfaces connected to UI |
 | Event Summarization | ✅ Done | NLP event sentences generated via YOLO worker pipeline |
 
-### Phase 6: Analytics & Heatmaps 🔲
+### Phase 6: Analytics & Heatmaps ✅
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| Hourly Detection Trends | 🔲 Planned | Time-series aggregation charts |
-| Activity Heatmaps | 🔲 Planned | GPU-processed movement density |
-| Behavioral Analysis | 🔲 Planned | Pattern detection across cameras |
-| Export Reports | 🔲 Planned | PDF/CSV analytics reports |
+| Hourly Detection Trends | ✅ Done | Line chart (hour-of-day aggregation via MongoDB pipeline) |
+| Daily Detection Trends | ✅ Done | Stacked BarChart grouped by event type |
+| Activity Heatmaps | ✅ Done | Canvas heatmap with blue-green-red thermal gradient |
+| Per-Camera Rankings | ✅ Done | Bar chart with proportional fill showing busiest cameras |
+| Event Distribution Pie | ✅ Done | Donut chart of detection percentages by type |
 
 ### Phase 7: Production Hardening 🔲
 

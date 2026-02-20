@@ -120,7 +120,10 @@ export const systemApi = {
 // --- Analytics API ---
 export const analyticsApi = {
     overview: (days?: number) => api.get('/analytics/overview', { params: { days } }),
-    trends: (params?: any) => api.get('/analytics/trends', { params }),
+    trends: (days?: number, cameraId?: string) => api.get('/analytics/trends', { params: { days, camera_id: cameraId } }),
+    daily: (days?: number, cameraId?: string) => api.get('/analytics/daily', { params: { days, camera_id: cameraId } }),
+    cameras: (days?: number) => api.get('/analytics/cameras', { params: { days } }),
+    topHours: (days?: number) => api.get('/analytics/top-hours', { params: { days } }),
 };
 
 // --- AI Assistant API ---
@@ -130,7 +133,11 @@ export const assistantApi = {
 };
 
 // --- Heatmaps API ---
-export const heatmapsApi = {
-    get: (cameraId: string, hours?: number) =>
-        api.get(`/heatmaps/${cameraId}`, { params: { hours } }),
+export const heatmapApi = {
+    getHeatmap: (cameraId: string, hours?: number, gridW?: number, gridH?: number) =>
+        api.get(`/heatmaps/${cameraId}`, { params: { hours, grid_w: gridW, grid_h: gridH } }),
+    summary: (hours?: number) => api.get('/heatmaps/', { params: { hours } }),
 };
+
+// Legacy alias
+export const heatmapsApi = heatmapApi;
