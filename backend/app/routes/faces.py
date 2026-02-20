@@ -7,10 +7,16 @@ from bson import ObjectId
 import aiofiles
 import os
 
+import os
+import cv2
+import numpy as np
+import asyncio
+
 from app.database import faces_collection
 from app.core.security import get_current_user, require_admin
 from app.models.face import FaceCreate, FaceUpdate, FaceResponse
 from app.config import settings
+from app.services.face_service import face_engine
 
 router = APIRouter(prefix="/api/faces", tags=["Faces"])
 
@@ -113,15 +119,33 @@ async def upload_reference_image(
         content = await file.read()
         await f.write(content)
 
+    # Process face embedding
+    nparr = np.frombuffer(content, np.uint8)
+    img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    embedding = await asyncio.to_thread(face_engine.extract_embedding, img_cv)
+    if embedding is None:
+        os.remove(filepath)
+        raise HTTPException(status_code=400, detail="No face detected in the reference image")
+
+    # Enroll in Qdrant
+    point_id = await asyncio.to_thread(face_engine.enroll_face, face_id, embedding)
+    if not point_id:
+        os.remove(filepath)
+        raise HTTPException(status_code=500, detail="Failed to indexing face in Qdrant")
+
     await faces_collection().update_one(
         {"_id": ObjectId(face_id)},
         {
-            "$push": {"reference_images": filepath},
+            "$push": {
+                "reference_images": filepath,
+                "embedding_ids": point_id
+            },
             "$set": {"updated_at": datetime.now(timezone.utc)},
         },
     )
 
-    return {"message": "Reference image uploaded", "path": filepath}
+    return {"message": "Reference image uploaded and face enrolled", "path": filepath, "qdrant_id": point_id}
 
 
 @router.delete("/{face_id}")

@@ -12,6 +12,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional
+from bson import ObjectId
 
 import cv2
 import numpy as np
@@ -88,6 +89,8 @@ class DetectionWorker:
             
         # Load model synchronously first so we don't block the loop later
         self.engine.load()
+        from app.services.face_service import face_engine
+        face_engine.load()
             
         self._running = True
         self._task = asyncio.create_task(self._run_loop(), name="yolo-worker")
@@ -208,12 +211,60 @@ class DetectionWorker:
         if not detected_objs:
             return
             
-        # We have valid detections. Check cooldown for the primary class.
-        if not tracker.can_trigger(highest_conf_class.value, settings.EVENT_COOLDOWN_SECONDS):
-            return
-            
         # Cooldown passed -> Create Event
-        await self._create_event(cam_id, highest_conf_class, highest_conf, primary_bbox, detected_objs, frame, result)
+        face_id = None
+        
+        # If PERSON detected, run Face Recognition pipeline
+        if highest_conf_class == EventType.PERSON and primary_bbox:
+            pad_w = int(primary_bbox.w * 0.2)
+            pad_h = int(primary_bbox.h * 0.2)
+            y1 = max(0, primary_bbox.y - pad_h)
+            y2 = min(frame.shape[0], primary_bbox.y + primary_bbox.h + pad_h)
+            x1 = max(0, primary_bbox.x - pad_w)
+            x2 = min(frame.shape[1], primary_bbox.x + primary_bbox.w + pad_w)
+            
+            crop = frame[y1:y2, x1:x2]
+            
+            if crop.size > 0:
+                from app.services.face_service import face_engine
+                from app.database import faces_collection
+                
+                embedding = await asyncio.to_thread(face_engine.extract_embedding, crop)
+                if embedding is not None:
+                    matched_id, score = await asyncio.to_thread(face_engine.match_face, embedding, threshold=0.5)
+                    
+                    if matched_id:
+                        face_id = matched_id
+                        highest_conf_class = EventType.FACE_KNOWN
+                        await faces_collection().update_one(
+                            {"_id": ObjectId(face_id)},
+                            {"$set": {"last_seen": datetime.now(timezone.utc)}, "$inc": {"total_appearances": 1}}
+                        )
+                    else:
+                        highest_conf_class = EventType.FACE_UNKNOWN
+                        now_utc = datetime.now(timezone.utc)
+                        doc = {
+                            "name": None,
+                            "is_known": False,
+                            "reference_images": [],
+                            "embedding_ids": [],
+                            "first_seen": now_utc,
+                            "last_seen": now_utc,
+                            "total_appearances": 1,
+                            "created_at": now_utc,
+                            "updated_at": now_utc,
+                        }
+                        insert_res = await faces_collection().insert_one(doc)
+                        face_id = str(insert_res.inserted_id)
+                        
+                        point_id = await asyncio.to_thread(face_engine.enroll_face, face_id, embedding)
+                        if point_id:
+                            await faces_collection().update_one(
+                                {"_id": insert_res.inserted_id},
+                                {"$push": {"embedding_ids": point_id}}
+                            )
+
+        await self._create_event(cam_id, highest_conf_class, highest_conf, primary_bbox, detected_objs, frame, result, face_id)
 
     def _map_class_to_event_type(self, yolo_class: str) -> EventType:
         """Map raw COCO class names to generic internal event types."""
@@ -232,7 +283,7 @@ class DetectionWorker:
     async def _create_event(
         self, cam_id: str, event_type: EventType, confidence: float, 
         primary_bbox: BoundingBox, detected_objs: list[DetectedObject], 
-        raw_frame: np.ndarray, result
+        raw_frame: np.ndarray, result, face_id: Optional[str] = None
     ):
         """Save snapshot, generate the database event."""
         from app.database import events_collection
@@ -261,7 +312,7 @@ class DetectionWorker:
             "bounding_box": primary_bbox.model_dump(),
             "ai_summary": f"Detected {len(detected_objs)} object(s).",
             "detected_objects": [obj.model_dump(by_alias=True) for obj in detected_objs],
-            "face_id": None,
+            "face_id": ObjectId(face_id) if face_id else None,
             "metadata": {},
             "created_at": now,
         }

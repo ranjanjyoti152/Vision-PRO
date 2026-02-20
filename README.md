@@ -268,7 +268,7 @@ Interactive docs available at **http://localhost:8090/docs** (Swagger UI).
 Phase 1 ████████████████████ 100%  Foundation
 Phase 2 ████████████████████ 100%  Camera Pipeline
 Phase 3 ████████████████████ 100%  AI Detection
-Phase 4 ░░░░░░░░░░░░░░░░░░░░   0%  Face Recognition
+Phase 4 ████████████████████ 100%  Face Recognition
 Phase 5 ░░░░░░░░░░░░░░░░░░░░   0%  Notifications & LLM
 Phase 6 ░░░░░░░░░░░░░░░░░░░░   0%  Analytics & Heatmaps
 Phase 7 ░░░░░░░░░░░░░░░░░░░░   0%  Production Hardening
@@ -311,15 +311,15 @@ Phase 7 ░░░░░░░░░░░░░░░░░░░░   0%  Produ
 | Detection Confidence Filter | ✅ Done | Configurable per-camera classification thresholds |
 | Model Hot-swap | ✅ Done | Dynamic YOLO model selection architecture |
 
-### Phase 4: Face Recognition 🔲
+### Phase 4: Face Recognition ✅
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| InsightFace Pipeline | 🔲 Planned | Face detection + embedding extraction |
-| Qdrant Vector Matching | 🔲 Planned | Known/unknown face classification |
-| Reference Image Processing | 🔲 Planned | Multi-angle face enrollment |
-| Face Clustering | 🔲 Planned | Group unknown faces |
-| Recognition Events | 🔲 Planned | Trigger alerts on specific faces |
+| InsightFace Pipeline | ✅ Done | GPU-enabled 512D ArcFace embedding extraction |
+| Qdrant Vector Matching | ✅ Done | High-speed cosine similarity search in `face_embeddings` |
+| Reference Image Processing | ✅ Done | Auto-enrollment via UI `POST /api/faces/{id}/reference` |
+| Face Clustering | ✅ Done | Unknown faces automatically grouped and tracked |
+| Recognition Events | ✅ Done | Yields `FACE_KNOWN` and `FACE_UNKNOWN` with DB bounding boxes |
 
 ### Phase 5: Notifications & LLM 🔲
 
