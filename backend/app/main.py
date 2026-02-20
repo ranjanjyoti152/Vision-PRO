@@ -33,12 +33,18 @@ async def lifespan(app: FastAPI):
     # Ensure storage directories exist
     os.makedirs(settings.RECORDING_PATH, exist_ok=True)
     os.makedirs(settings.MODELS_PATH, exist_ok=True)
+    os.makedirs(settings.SNAPSHOT_PATH, exist_ok=True)
 
-    logger.info("✅ All services initialized")
+    # Start camera streams
+    from app.services.stream_manager import stream_manager
+    count = await stream_manager.start_all()
+
+    logger.info(f"✅ All services initialized ({count} camera streams)")
     yield
 
     # Shutdown
     logger.info("🛑 Shutting down...")
+    await stream_manager.stop_all()
     await disconnect_db()
     await disconnect_qdrant()
     logger.info("👋 Goodbye!")

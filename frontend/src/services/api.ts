@@ -50,6 +50,12 @@ export const camerasApi = {
     create: (data: any) => api.post('/cameras', data),
     update: (id: string, data: any) => api.put(`/cameras/${id}`, data),
     delete: (id: string) => api.delete(`/cameras/${id}`),
+    // Stream control
+    startStream: (id: string) => api.post(`/cameras/${id}/start`),
+    stopStream: (id: string) => api.post(`/cameras/${id}/stop`),
+    snapshotUrl: (id: string) => `/api/cameras/${id}/snapshot`,
+    streamStatus: (id: string) => api.get(`/cameras/${id}/stream-status`),
+    allStreamStatuses: () => api.get('/cameras/streams/all-status'),
 };
 
 // --- Events API ---

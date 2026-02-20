@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # --- Storage Paths ---
     RECORDING_PATH: str = "./recordings"
     MODELS_PATH: str = "./models"
+    SNAPSHOT_PATH: str = "./snapshots"
+    STREAM_JPEG_QUALITY: int = 80
+    STREAM_MAX_FPS: int = 15
 
     @property
     def RECORDING_DIR(self) -> Path:
