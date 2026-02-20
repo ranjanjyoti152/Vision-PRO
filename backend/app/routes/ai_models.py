@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, UploadFile, File
 from bson import ObjectId
 import os
+import json
 import aiofiles
 
 from app.database import ai_models_collection
@@ -18,6 +19,9 @@ from app.models.ai_model import (
 from app.config import settings
 
 router = APIRouter(prefix="/api/models", tags=["AI Models"])
+
+# Shared active-model config — written here, read by the DeepStream entrypoint
+ACTIVE_MODEL_FILE = os.path.join(settings.MODELS_PATH, "active_model.json")
 
 
 def _model_doc_to_response(doc: dict) -> AIModelResponse:
@@ -35,6 +39,19 @@ def _model_doc_to_response(doc: dict) -> AIModelResponse:
     )
 
 
+def _write_active_model(pt_path: str, model_name: str) -> None:
+    """Persist the active model selection to a shared JSON file."""
+    os.makedirs(settings.MODELS_PATH, exist_ok=True)
+    data = {
+        "pt_path": pt_path,
+        "engine_path": pt_path.replace(".pt", ".engine"),
+        "model_name": model_name,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(ACTIVE_MODEL_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
 @router.get("", response_model=list[AIModelResponse])
 async def list_models(user: dict = Depends(get_current_user)):
     """List all downloaded/uploaded AI models."""
@@ -49,19 +66,31 @@ async def list_available_models(user: dict = Depends(get_current_user)):
     return AVAILABLE_YOLO_MODELS
 
 
+@router.get("/active")
+async def get_active_model(user: dict = Depends(get_current_user)):
+    """Return the currently active model (read from shared config file)."""
+    if os.path.exists(ACTIVE_MODEL_FILE):
+        with open(ACTIVE_MODEL_FILE) as f:
+            return json.load(f)
+    # Default fallback
+    return {
+        "pt_path": str(settings.YOLO_MODELS_DIR / "yolov8n.pt"),
+        "engine_path": str(settings.YOLO_MODELS_DIR / "yolov8n.engine"),
+        "model_name": "yolov8n",
+        "updated_at": None,
+    }
+
+
 @router.post("/download")
 async def download_model(
     request: ModelDownloadRequest,
     admin: dict = Depends(require_admin),
 ):
     """Download a YOLO model. Runs in background."""
-    # Check if already downloaded
     existing = await ai_models_collection().find_one({"name": request.model_name})
     if existing:
         raise HTTPException(status_code=409, detail="Model already downloaded")
 
-    # TODO: In Phase 3, implement actual download via ultralytics
-    # For now, register the intent
     now = datetime.now(timezone.utc)
     doc = {
         "name": request.model_name,
@@ -87,7 +116,10 @@ async def set_default_model(
     model_id: str,
     admin: dict = Depends(require_admin),
 ):
-    """Set a model as the default detection model."""
+    """
+    Set a model as the default detection model.
+    Also writes active_model.json so the DeepStream container picks it up on restart.
+    """
     model = await ai_models_collection().find_one({"_id": ObjectId(model_id)})
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
@@ -104,7 +136,52 @@ async def set_default_model(
         {"$set": {"is_default": True}},
     )
 
-    return {"message": f"{model['name']} set as default"}
+    # Write to shared volume config so DeepStream picks it up on restart
+    pt_path = model.get("file_path", str(settings.YOLO_MODELS_DIR / f"{model['name']}.pt"))
+    _write_active_model(pt_path, model["name"])
+
+    # Also hot-reload the standard YOLO worker if not using DeepStream
+    if not settings.DEEPSTREAM_ENABLED:
+        try:
+            from app.workers.yolo_worker import detection_worker
+            await detection_worker.reload_model(pt_path)
+        except Exception as e:
+            pass  # Non-critical for standard mode
+
+    return {
+        "message": f"{model['name']} set as default",
+        "deepstream_restart_required": settings.DEEPSTREAM_ENABLED,
+        "active_model_file": ACTIVE_MODEL_FILE,
+    }
+
+
+@router.post("/deepstream/reload")
+async def reload_deepstream(admin: dict = Depends(require_admin)):
+    """
+    Restart the DeepStream Docker container so it picks up the new model.
+    Requires the Docker socket to be mounted: /var/run/docker.sock
+    """
+    if not settings.DEEPSTREAM_ENABLED:
+        raise HTTPException(status_code=400, detail="DeepStream is not enabled")
+
+    try:
+        import docker  # pip install docker
+        client = docker.from_env()
+        container = client.containers.get("visionpro-deepstream")
+        container.restart(timeout=5)
+        return {
+            "message": "DeepStream container restarting — new model will be loaded",
+            "container": container.name,
+            "status": "restarting",
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Could not restart DeepStream container: {e}. "
+                "Run manually: docker restart visionpro-deepstream"
+            ),
+        )
 
 
 @router.post("/upload")
@@ -148,9 +225,10 @@ async def delete_model(model_id: str, admin: dict = Depends(require_admin)):
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
 
-    # Delete file if exists
     if model.get("file_path") and os.path.exists(model["file_path"]):
         os.remove(model["file_path"])
 
     await ai_models_collection().delete_one({"_id": ObjectId(model_id)})
     return {"message": "Model deleted successfully"}
+
+

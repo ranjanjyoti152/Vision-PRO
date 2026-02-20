@@ -31,6 +31,7 @@ Pillow>=10.0.0
 # DeepStream / ZMQ bridge (used when DEEPSTREAM_ENABLED=True)
 pyzmq>=25.1.2
 msgpack>=1.0.8
+docker>=7.0.0   # Docker SDK — used by /api/models/deepstream/reload
 
 # Notifications
 python-telegram-bot>=21.5
