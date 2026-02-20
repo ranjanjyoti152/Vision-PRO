@@ -46,6 +46,39 @@ services:
       timeout: 5s
       retries: 5
 
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    container_name: visionpro-backend
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - DEEPSTREAM_ENABLED=${DEEPSTREAM_ENABLED:-false}
+      - DEEPSTREAM_HOST=deepstream
+      - DEEPSTREAM_ZMQ_PORT=5570
+    volumes:
+      - ../backend:/app
+      - ../backend/models:/app/models
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${BACKEND_PORT:-8090}:8090"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - visionpro-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
   deepstream:
     build:
       context: ..
