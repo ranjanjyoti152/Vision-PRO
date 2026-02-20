@@ -39,11 +39,17 @@ async def lifespan(app: FastAPI):
     from app.services.stream_manager import stream_manager
     count = await stream_manager.start_all()
 
+    # Start AI Detection pipeline
+    from app.workers.yolo_worker import detection_worker
+    detection_worker.start()
+
     logger.info(f"✅ All services initialized ({count} camera streams)")
     yield
 
     # Shutdown
     logger.info("🛑 Shutting down...")
+    from app.workers.yolo_worker import detection_worker
+    await detection_worker.stop()
     await stream_manager.stop_all()
     await disconnect_db()
     await disconnect_qdrant()
@@ -98,6 +104,13 @@ if os.path.exists(settings.RECORDING_PATH):
         "/recordings",
         StaticFiles(directory=settings.RECORDING_PATH),
         name="recordings",
+    )
+
+if os.path.exists(settings.SNAPSHOT_PATH):
+    app.mount(
+        "/snapshots",
+        StaticFiles(directory=settings.SNAPSHOT_PATH),
+        name="snapshots",
     )
 
 

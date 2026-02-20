@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     STREAM_JPEG_QUALITY: int = 80
     STREAM_MAX_FPS: int = 15
 
+    # --- AI Detection ---
+    YOLO_INFERENCE_INTERVAL: float = 1.0
+    EVENT_COOLDOWN_SECONDS: int = 15
+
     @property
     def RECORDING_DIR(self) -> Path:
         path = Path(self.RECORDING_PATH)
