@@ -10,8 +10,12 @@ Each camera gets a dedicated CameraStream task that:
 import asyncio
 import logging
 import time
+import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional
+
+# Force OpenCV FFmpeg backend to use TCP for RTSP to prevent UDP packet loss (macroblock corruption)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 import cv2
 import numpy as np

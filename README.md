@@ -266,8 +266,8 @@ Interactive docs available at **http://localhost:8090/docs** (Swagger UI).
 
 ```
 Phase 1 ████████████████████ 100%  Foundation
-Phase 2 ░░░░░░░░░░░░░░░░░░░░   0%  Camera Pipeline
-Phase 3 ░░░░░░░░░░░░░░░░░░░░   0%  AI Detection
+Phase 2 ████████████████████ 100%  Camera Pipeline
+Phase 3 ████████████████████ 100%  AI Detection
 Phase 4 ░░░░░░░░░░░░░░░░░░░░   0%  Face Recognition
 Phase 5 ░░░░░░░░░░░░░░░░░░░░   0%  Notifications & LLM
 Phase 6 ░░░░░░░░░░░░░░░░░░░░   0%  Analytics & Heatmaps
@@ -291,25 +291,25 @@ Phase 7 ░░░░░░░░░░░░░░░░░░░░   0%  Produ
 | API Service Layer | ✅ Done | Axios + JWT interceptors |
 | User Management | ✅ Done | CRUD, roles, first-user-is-admin |
 
-### Phase 2: Camera Pipeline 🔲
+### Phase 2: Camera Pipeline ✅
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| RTSP Stream Reader | 🔲 Planned | OpenCV VideoCapture with reconnection |
-| Live Stream WebSocket | 🔲 Planned | MJPEG streaming to frontend |
-| Camera Health Monitor | 🔲 Planned | Connectivity checks, auto-reconnect |
-| Stream Snapshot API | 🔲 Planned | On-demand frame capture |
-| Multi-stream Manager | 🔲 Planned | Concurrent camera handling |
+| RTSP Stream Reader | ✅ Done | OpenCV VideoCapture with TCP transport |
+| Live Stream WebSocket | ✅ Done | MJPEG streaming to frontend canvas |
+| Camera Health Monitor | ✅ Done | Connectivity checks, auto-reconnect backoff |
+| Stream Snapshot API | ✅ Done | On-demand frame capture |
+| Multi-stream Manager | ✅ Done | Concurrent background threading |
 
-### Phase 3: AI Detection Engine 🔲
+### Phase 3: AI Detection Engine ✅
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| YOLO Inference Worker | 🔲 Planned | GPU-accelerated detection pipeline |
-| Detection Event Creation | 🔲 Planned | Bounding boxes, crops, metadata |
-| Smart Recording Trigger | 🔲 Planned | Pre/post buffer recording |
-| Detection Confidence Filter | 🔲 Planned | Configurable per-camera thresholds |
-| Model Hot-swap | 🔲 Planned | Switch models without restart |
+| YOLO Inference Worker | ✅ Done | GPU-accelerated PyTorch threadpool worker |
+| Detection Event Creation | ✅ Done | Bounding boxes, snapshot generation |
+| Smart Recording Trigger | 🔲 Planned | Pre/post buffer recording (Deferred to Phase 7) |
+| Detection Confidence Filter | ✅ Done | Configurable per-camera classification thresholds |
+| Model Hot-swap | ✅ Done | Dynamic YOLO model selection architecture |
 
 ### Phase 4: Face Recognition 🔲
 
