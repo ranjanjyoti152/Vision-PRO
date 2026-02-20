@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     YOLO_INFERENCE_INTERVAL: float = 1.0
     EVENT_COOLDOWN_SECONDS: int = 15
 
+    # --- DeepStream (GPU-native pipeline) ---
+    DEEPSTREAM_ENABLED: bool = False          # Set True when DeepStream container is running
+    DEEPSTREAM_HOST: str = "deepstream"       # Docker service name / hostname
+    DEEPSTREAM_ZMQ_PORT: int = 5570          # ZMQ PUSH port from DeepStream container
+    TRT_ENGINE_PATH: str = "./models/yolo/yolov8n.engine"
+    DS_CONF_THRESHOLD: float = 0.45
+
     @property
     def RECORDING_DIR(self) -> Path:
         path = Path(self.RECORDING_PATH)

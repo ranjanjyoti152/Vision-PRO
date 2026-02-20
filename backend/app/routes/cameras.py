@@ -230,17 +230,22 @@ async def get_stream_status(camera_id: str, user: dict = Depends(get_current_use
 async def websocket_live_feed(websocket: WebSocket, camera_id: str):
     """
     WebSocket endpoint for live MJPEG camera feed.
-    Binary frames are JPEG-encoded and sent as bytes.
-    The StreamManager broadcasts to this channel automatically.
+    Binary JPEG frames are broadcast by StreamManager to all subscribers on this channel.
     """
     channel = f"camera:{camera_id}"
     await ws_manager.connect(websocket, channel)
     try:
-        # Keep connection alive — just wait for disconnect
+        # Keep alive: read any incoming frame (client never sends data, but we must
+        # drain the receive buffer so ping/close frames are processed correctly).
         while True:
-            # We don't expect messages from the client, but read to detect disconnect
-            await websocket.receive_text()
+            message = await websocket.receive()
+            # "websocket.disconnect" type signals clean close
+            if message.get("type") == "websocket.disconnect":
+                break
+            # Ignore text/binary data from the client (none expected)
     except WebSocketDisconnect:
+        pass
+    except Exception:
         pass
     finally:
         await ws_manager.disconnect(websocket, channel)

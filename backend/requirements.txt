@@ -28,6 +28,10 @@ onnxruntime-gpu>=1.19.0
 # Image Processing
 Pillow>=10.0.0
 
+# DeepStream / ZMQ bridge (used when DEEPSTREAM_ENABLED=True)
+pyzmq>=25.1.2
+msgpack>=1.0.8
+
 # Notifications
 python-telegram-bot>=21.5
 aiosmtplib>=3.0.1

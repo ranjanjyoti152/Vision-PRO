@@ -2,6 +2,9 @@
 Vision Pro Dezine – Uvicorn Server Launcher
 Usage: python run.py [--port PORT] [--host HOST]
 """
+import os
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"  # Suppress albumentations version-check nag
+
 import argparse
 import uvicorn
 from app.config import settings

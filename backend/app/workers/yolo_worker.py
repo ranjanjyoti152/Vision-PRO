@@ -341,5 +341,118 @@ class DetectionWorker:
             notification_service.dispatch(ai_summary, str(snapshot_abs_path))
         )
 
+    async def handle_deepstream_event(
+        self,
+        camera_id: str,
+        detections: list,
+        jpeg: Optional[bytes],
+        timestamp: float,
+    ) -> None:
+        """
+        Entry point called by the DeepStream ZMQ receiver.
+        Mirrors _process_results() but works from pre-parsed detection dicts
+        produced by the GStreamer pad probe (no OpenCV / PyTorch needed here).
+        """
+        if not detections:
+            return
+
+        tracker = self.cooldown_trackers.get(camera_id)
+        if not tracker:
+            tracker = CooldownTracker()
+            self.cooldown_trackers[camera_id] = tracker
+
+        # Pick the highest-confidence detection as the primary event trigger
+        primary = max(detections, key=lambda d: d.get("confidence", 0))
+        event_type_str = primary.get("event_type", "custom")
+
+        try:
+            event_type = EventType(event_type_str)
+        except ValueError:
+            event_type = EventType.CUSTOM
+
+        conf = float(primary.get("confidence", 0.0))
+        if conf < 0.45:
+            return
+
+        if not tracker.can_trigger(event_type.value, settings.EVENT_COOLDOWN_SECONDS):
+            return
+
+        # Build BoundingBox and DetectedObjects from DS detection dicts
+        bbox_raw = primary.get("bbox", [0, 0, 100, 100])
+        primary_bbox = BoundingBox(
+            x=int(bbox_raw[0]), y=int(bbox_raw[1]),
+            width=int(bbox_raw[2]), height=int(bbox_raw[3]),
+        )
+
+        detected_objs = [
+            DetectedObject(
+                class_name=d.get("class_name", "unknown"),
+                confidence=float(d.get("confidence", 0.0)),
+                bounding_box=BoundingBox(
+                    x=int(d["bbox"][0]), y=int(d["bbox"][1]),
+                    width=int(d["bbox"][2]), height=int(d["bbox"][3]),
+                )
+            )
+            for d in detections
+        ]
+
+        await self._create_event_from_jpeg(
+            cam_id=camera_id,
+            event_type=event_type,
+            confidence=conf,
+            primary_bbox=primary_bbox,
+            detected_objs=detected_objs,
+            jpeg=jpeg,
+        )
+
+    async def _create_event_from_jpeg(
+        self,
+        cam_id: str,
+        event_type: EventType,
+        confidence: float,
+        primary_bbox: BoundingBox,
+        detected_objs: list,
+        jpeg: Optional[bytes],
+    ) -> None:
+        """Create a DB event from a raw JPEG snapshot (DeepStream path)."""
+        from app.database import events_collection
+        import uuid
+
+        event_uuid = str(uuid.uuid4())
+        snapshot_filename = f"{cam_id}_{event_uuid}.jpg"
+        snapshot_abs_path = settings.SNAPSHOT_DIR / snapshot_filename
+
+        if jpeg:
+            await asyncio.to_thread(snapshot_abs_path.write_bytes, jpeg)
+
+        ai_summary = await llm_service.generate_event_summary(
+            event_type, confidence, [obj.model_dump(by_alias=True) for obj in detected_objs]
+        )
+
+        now = datetime.now(timezone.utc)
+        event_doc = {
+            "camera_id":       cam_id,
+            "event_type":      event_type.value,
+            "confidence":      confidence,
+            "timestamp":       now,
+            "snapshot_path":   f"/snapshots/{snapshot_filename}" if jpeg else "",
+            "video_clip_path": "",
+            "bounding_box":    primary_bbox.model_dump(),
+            "ai_summary":      ai_summary,
+            "detected_objects": [obj.model_dump(by_alias=True) for obj in detected_objs],
+            "face_id":         None,
+            "metadata":        {"source": "deepstream"},
+            "created_at":      now,
+        }
+
+        await events_collection().insert_one(event_doc)
+        logger.info(f"🚨 [DeepStream] Event: {event_type.value} on cam {cam_id} ({confidence:.2f})")
+
+        if jpeg:
+            asyncio.create_task(
+                notification_service.dispatch(ai_summary, str(snapshot_abs_path))
+            )
+
+
 # Singleton
 detection_worker = DetectionWorker()

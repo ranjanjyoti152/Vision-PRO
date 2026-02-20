@@ -35,22 +35,38 @@ async def lifespan(app: FastAPI):
     os.makedirs(settings.MODELS_PATH, exist_ok=True)
     os.makedirs(settings.SNAPSHOT_PATH, exist_ok=True)
 
-    # Start camera streams
-    from app.services.stream_manager import stream_manager
-    count = await stream_manager.start_all()
+    if settings.DEEPSTREAM_ENABLED:
+        # ── DeepStream mode: GPU pipeline in Docker handles RTSP decode + inference ──
+        logger.info("🚀 DeepStream mode enabled — skipping OpenCV stream_manager")
+        from app.deepstream.receiver import deepstream_receiver
+        deepstream_receiver.start()
+        # Still start yolo_worker so event/face/notification logic is available
+        from app.workers.yolo_worker import detection_worker
+        detection_worker.start()
+        logger.info("✅ DeepStream receiver + event worker started")
+    else:
+        # ── Standard mode: OpenCV capture + PyTorch YOLO ──────────────────────────
+        from app.services.stream_manager import stream_manager
+        count = await stream_manager.start_all()
 
-    # Start AI Detection pipeline
-    from app.workers.yolo_worker import detection_worker
-    detection_worker.start()
+        from app.workers.yolo_worker import detection_worker
+        detection_worker.start()
+        logger.info(f"✅ All services initialized ({count} camera streams)")
 
-    logger.info(f"✅ All services initialized ({count} camera streams)")
     yield
 
     # Shutdown
     logger.info("🛑 Shutting down...")
     from app.workers.yolo_worker import detection_worker
     await detection_worker.stop()
-    await stream_manager.stop_all()
+
+    if settings.DEEPSTREAM_ENABLED:
+        from app.deepstream.receiver import deepstream_receiver
+        await deepstream_receiver.stop()
+    else:
+        from app.services.stream_manager import stream_manager
+        await stream_manager.stop_all()
+
     await disconnect_db()
     await disconnect_qdrant()
     logger.info("👋 Goodbye!")

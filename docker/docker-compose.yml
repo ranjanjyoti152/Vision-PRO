@@ -46,6 +46,43 @@ services:
       timeout: 5s
       retries: 5
 
+  deepstream:
+    build:
+      context: ..
+      dockerfile: docker/deepstream/Dockerfile
+    image: visionpro-deepstream:latest
+    container_name: visionpro-deepstream
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=video,compute,utility
+      - MONGO_URI=mongodb://${MONGO_USER:-visionpro}:${MONGO_PASS:-visionpro_secret}@mongodb:27917/visionpro?authSource=admin
+      - TRT_ENGINE_PATH=/models/yolo/yolov8n.engine
+      - YOLO_PT_PATH=/models/yolo/yolov8n.pt
+      - DS_ZMQ_ENDPOINT=tcp://*:5570
+      - CONF_THRESHOLD=${DS_CONF_THRESHOLD:-0.45}
+      - TARGET_FPS=${STREAM_MAX_FPS:-30}
+    volumes:
+      - ../backend:/app
+      - ../backend/models:/models
+    ports:
+      - "${DEEPSTREAM_ZMQ_PORT:-5570}:5570"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - visionpro-net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
+
 volumes:
   mongo_data:
     driver: local

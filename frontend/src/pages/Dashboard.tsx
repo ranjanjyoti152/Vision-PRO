@@ -44,6 +44,7 @@ const LiveCameraFeed: React.FC<LiveCanvasProps> = ({ cameraId, cameraName, locat
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const [connected, setConnected] = useState(false);
+    const [hasFrame, setHasFrame] = useState(false);
     const [fps, setFps] = useState(0);
     const [fullscreen, setFullscreen] = useState(false);
     const containerRef = useRef<HTMLDivElement>(null);
@@ -73,6 +74,8 @@ const LiveCameraFeed: React.FC<LiveCanvasProps> = ({ cameraId, cameraName, locat
                         const ctx = canvas.getContext('2d');
                         if (ctx) {
                             ctx.drawImage(img, 0, 0);
+                            // Only hide the overlay once a real frame is painted
+                            setHasFrame(true);
                         }
                     }
                     URL.revokeObjectURL(url);
@@ -91,6 +94,7 @@ const LiveCameraFeed: React.FC<LiveCanvasProps> = ({ cameraId, cameraName, locat
 
         ws.onclose = () => {
             setConnected(false);
+            setHasFrame(false);  // Reset so overlay reappears on reconnect
             // Auto-reconnect after 3s
             setTimeout(() => {
                 if (wsRef.current === ws) {
@@ -101,12 +105,14 @@ const LiveCameraFeed: React.FC<LiveCanvasProps> = ({ cameraId, cameraName, locat
 
         ws.onerror = () => {
             setConnected(false);
+            setHasFrame(false);
         };
 
         wsRef.current = ws;
     }, [cameraId]);
 
     useEffect(() => {
+        setHasFrame(false);  // Reset on camera change
         connectWs();
         return () => {
             if (wsRef.current) {
@@ -199,15 +205,17 @@ const LiveCameraFeed: React.FC<LiveCanvasProps> = ({ cameraId, cameraName, locat
                 </IconButton>
             </Box>
 
-            {/* No-feed placeholder */}
-            {!connected && (
+            {/* No-feed placeholder — stays until first real frame is painted */}
+            {!hasFrame && (
                 <Box sx={{
                     position: 'absolute', inset: 0,
                     display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
                     bgcolor: 'rgba(0,0,0,0.7)',
                 }}>
                     <CameraAlt sx={{ fontSize: 40, color: 'text.secondary', mb: 1 }} />
-                    <Typography variant="body2" color="text.secondary">Connecting...</Typography>
+                    <Typography variant="body2" color="text.secondary">
+                        {connected ? 'Waiting for stream…' : 'Connecting…'}
+                    </Typography>
                 </Box>
             )}
         </Box>
