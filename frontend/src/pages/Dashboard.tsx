@@ -288,13 +288,15 @@ const Dashboard: React.FC = () => {
         },
         {
             label: 'CPU Usage',
-            value: stats ? `${stats.cpu_percent || 0}%` : '—',
+            value: stats ? `${stats.cpu?.percent ?? stats.cpu_percent ?? 0}%` : '—',
             icon: <People />,
             color: '#7C4DFF',
         },
         {
             label: 'GPU Memory',
-            value: stats?.gpu?.length ? `${stats.gpu[0].memory_used_mb || 0} MB` : 'N/A',
+            value: stats?.gpu?.devices?.length
+                ? `${stats.gpu.devices[0].memory_used_mb ?? 0} MB`
+                : 'N/A',
             icon: <Storage />,
             color: '#00E676',
         },
@@ -323,21 +325,26 @@ const Dashboard: React.FC = () => {
                         <Card sx={{
                             background: `linear-gradient(135deg, ${stat.color}15 0%, ${stat.color}05 100%)`,
                             border: `1px solid ${stat.color}30`,
+                            height: '100%',
                         }}>
-                            <CardContent sx={{ py: 2, '&:last-child': { pb: 2 } }}>
-                                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                                    <Box>
-                                        <Typography variant="caption" sx={{ color: 'text.secondary', textTransform: 'uppercase', fontWeight: 600, fontSize: '0.65rem' }}>
+                            <CardContent sx={{ py: 2, px: 2.5, '&:last-child': { pb: 2 }, height: '100%', boxSizing: 'border-box' }}>
+                                <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', height: '100%' }}>
+                                    <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.25 }}>
+                                        <Typography variant="caption" sx={{ color: 'text.secondary', textTransform: 'uppercase', fontWeight: 600, fontSize: '0.65rem', letterSpacing: '0.05em' }}>
                                             {stat.label}
                                         </Typography>
-                                        <Typography variant="h5" sx={{ fontWeight: 700 }}>{loading ? <Skeleton width={40} /> : stat.value}</Typography>
+                                        <Typography variant="h5" sx={{ fontWeight: 700, lineHeight: 1.2 }}>
+                                            {loading ? <Skeleton width={40} /> : stat.value}
+                                        </Typography>
                                         {'online' in stat && (
-                                            <Typography variant="caption" sx={{ color: '#00E676' }}>
+                                            <Typography variant="caption" sx={{ color: '#00E676', fontSize: '0.72rem', mt: 0.25 }}>
                                                 {stat.online} online
                                             </Typography>
                                         )}
                                     </Box>
-                                    <Box sx={{ color: stat.color, opacity: 0.7 }}>{stat.icon}</Box>
+                                    <Box sx={{ color: stat.color, opacity: 0.7, mt: 0.25, flexShrink: 0 }}>
+                                        {stat.icon}
+                                    </Box>
                                 </Box>
                             </CardContent>
                         </Card>

@@ -42,3 +42,9 @@ logs/
 
 # Docker volumes
 docker/data/
+
+# Runtime-generated data (snapshots, model downloads)
+snapshots/
+backend/snapshots/
+backend/models/
+*.pt

@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 import {
-    Box, Typography, Card, CardContent, Grid, MenuItem,
+    Box, Typography, Card, CardContent, MenuItem,
     Select, FormControl, InputLabel, CircularProgress, Chip, Stack
 } from '@mui/material';
 import { Whatshot, CameraAlt } from '@mui/icons-material';

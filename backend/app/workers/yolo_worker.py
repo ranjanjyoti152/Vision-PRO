@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional
 from bson import ObjectId
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -295,7 +296,7 @@ class DetectionWorker:
         # 1. Plot boxes on frame and save snapshot
         annotated_frame = result.plot()
         snapshot_filename = f"{cam_id}_{event_uuid}.jpg"
-        snapshot_abs_path = settings.SNAPSHOT_PATH / snapshot_filename
+        snapshot_abs_path = settings.SNAPSHOT_DIR / snapshot_filename
         
         await asyncio.to_thread(
             cv2.imwrite, str(snapshot_abs_path), annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85]

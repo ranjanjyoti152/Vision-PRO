@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     MODELS_PATH: str = "./models"
     SNAPSHOT_PATH: str = "./snapshots"
     STREAM_JPEG_QUALITY: int = 80
-    STREAM_MAX_FPS: int = 15
+    STREAM_MAX_FPS: int = 30
 
     # --- AI Detection ---
     YOLO_INFERENCE_INTERVAL: float = 1.0
@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     @property
     def YOLO_MODELS_DIR(self) -> Path:
         path = self.MODELS_DIR / "yolo"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def SNAPSHOT_DIR(self) -> Path:
+        path = Path(self.SNAPSHOT_PATH)
         path.mkdir(parents=True, exist_ok=True)
         return path
 
