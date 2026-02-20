@@ -1,0 +1,44 @@
+# Environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+
+# Node
+node_modules/
+frontend/dist/
+.vite/
+
+# AI Models (large files)
+models/yolo/*.pt
+models/yolo/*.onnx
+models/faces/*.onnx
+
+# Recordings
+recordings/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Docker volumes
+docker/data/

@@ -1,0 +1,53 @@
+# Vision Pro Dezine – Backend Dependencies
+# ==========================================
+
+# Web Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.31.1
+python-multipart>=0.0.9
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+pydantic>=2.9.0
+pydantic-settings>=2.5.2
+
+# Database
+motor>=3.6.0
+pymongo>=4.9.0
+
+# Vector Database
+qdrant-client>=1.12.0
+
+# AI / ML
+ultralytics>=8.3.0
+opencv-python-headless>=4.10.0
+numpy>=1.26.0,<2.0.0
+torch>=2.1.0
+insightface>=0.7.3
+onnxruntime-gpu>=1.19.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# Notifications
+python-telegram-bot>=21.5
+aiosmtplib>=3.0.1
+
+# LLM Integration
+openai>=1.50.0
+httpx>=0.28.1
+aiohttp>=3.10.0
+
+# Encryption
+cryptography>=43.0.0
+
+# System Monitoring
+psutil>=6.0.0
+GPUtil>=1.4.0
+pynvml>=11.5.0
+
+# Utilities
+python-dotenv>=1.0.1
+aiofiles>=24.1.0
+websockets>=13.0
+orjson>=3.10.0
+bcrypt>=4.0.0

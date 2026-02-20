@@ -1,0 +1,57 @@
+services:
+  mongodb:
+    image: mongo:7
+    container_name: visionpro-mongodb
+    restart: unless-stopped
+    ports:
+      - "${MONGO_PORT:-27917}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-visionpro}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASS:-visionpro_secret}
+      MONGO_INITDB_DATABASE: visionpro
+    volumes:
+      - mongo_data:/data/db
+      - ./mongo-init.js:/docker-entrypoint-initdb.d/init.js:ro
+    networks:
+      - visionpro-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: visionpro-qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_PORT:-6933}:6333"
+      - "${QDRANT_GRPC_PORT:-6934}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - visionpro-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongo_data:
+    driver: local
+  qdrant_data:
+    driver: local
+
+networks:
+  visionpro-net:
+    driver: bridge
