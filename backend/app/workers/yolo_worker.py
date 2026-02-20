@@ -24,6 +24,8 @@ from ultralytics import YOLO
 from app.config import settings
 from app.services.stream_manager import stream_manager
 from app.models.event import EventType, EventCreate, BoundingBox, DetectedObject
+from app.services.llm_service import llm_service
+from app.services.notification_service import notification_service
 
 logger = logging.getLogger(__name__)
 
@@ -299,7 +301,19 @@ class DetectionWorker:
             cv2.imwrite, str(snapshot_abs_path), annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85]
         )
         
-        # 2. Construct DB Event (directly bypassing internal HTTP calls for speed)
+        # 2. Get AI Summary from LLM Service
+        face_name = None
+        if face_id:
+            from app.database import faces_collection
+            face_doc = await faces_collection().find_one({"_id": ObjectId(face_id)})
+            if face_doc:
+                face_name = face_doc.get("name")
+                
+        ai_summary = await llm_service.generate_event_summary(
+            event_type, confidence, [obj.model_dump(by_alias=True) for obj in detected_objs], face_name
+        )
+        
+        # 3. Construct DB Event
         now = datetime.now(timezone.utc)
         
         event_doc = {
@@ -310,7 +324,7 @@ class DetectionWorker:
             "snapshot_path": f"/snapshots/{snapshot_filename}",
             "video_clip_path": "",  # To be filled by Recording worker later
             "bounding_box": primary_bbox.model_dump(),
-            "ai_summary": f"Detected {len(detected_objs)} object(s).",
+            "ai_summary": ai_summary,
             "detected_objects": [obj.model_dump(by_alias=True) for obj in detected_objs],
             "face_id": ObjectId(face_id) if face_id else None,
             "metadata": {},
@@ -319,6 +333,12 @@ class DetectionWorker:
         
         await events_collection().insert_one(event_doc)
         logger.info(f"🚨 Event generated: {event_type.value} on camera {cam_id} ({confidence:.2f})")
+        
+        # 4. Dispatch Notifications
+        # Fire and forget (don't wait for completion) to avoid blocking the detection loop
+        asyncio.create_task(
+            notification_service.dispatch(ai_summary, str(snapshot_abs_path))
+        )
 
 # Singleton
 detection_worker = DetectionWorker()

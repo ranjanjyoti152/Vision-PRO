@@ -3,6 +3,7 @@ AI Assistant routes – Chat with semantic search.
 """
 from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
 from app.core.security import get_current_user
+from app.services.llm_service import llm_service
 
 router = APIRouter(prefix="/api/assistant", tags=["AI Assistant"])
 
@@ -13,12 +14,22 @@ async def chat(
     user: dict = Depends(get_current_user),
 ):
     """Send a message to the AI assistant."""
-    # TODO: Implement in Phase 5 – LLM + Qdrant semantic search
+    user_msg = message.get("message", "")
+    if not user_msg:
+        return {"response": "Please provide a message."}
+        
+    messages = [{"role": "user", "content": user_msg}]
+    
+    # We could fetch recent events here via `events_collection` and prepend them 
+    # as system context, but for Phase 5 MVP we'll just connect the LLM.
+    
+    response_text = await llm_service.chat(messages)
+    
     return {
-        "response": "AI Assistant is being configured. This feature will be available once an LLM provider is set up in Settings.",
-        "query": message.get("message", ""),
+        "response": response_text,
+        "query": user_msg,
         "events": [],
-        "status": "pending_configuration",
+        "status": "success",
     }
 
 

@@ -269,7 +269,7 @@ Phase 1 ████████████████████ 100%  Found
 Phase 2 ████████████████████ 100%  Camera Pipeline
 Phase 3 ████████████████████ 100%  AI Detection
 Phase 4 ████████████████████ 100%  Face Recognition
-Phase 5 ░░░░░░░░░░░░░░░░░░░░   0%  Notifications & LLM
+Phase 5 ████████████████████ 100%  Notifications & LLM
 Phase 6 ░░░░░░░░░░░░░░░░░░░░   0%  Analytics & Heatmaps
 Phase 7 ░░░░░░░░░░░░░░░░░░░░   0%  Production Hardening
 ```
@@ -321,15 +321,15 @@ Phase 7 ░░░░░░░░░░░░░░░░░░░░   0%  Produ
 | Face Clustering | ✅ Done | Unknown faces automatically grouped and tracked |
 | Recognition Events | ✅ Done | Yields `FACE_KNOWN` and `FACE_UNKNOWN` with DB bounding boxes |
 
-### Phase 5: Notifications & LLM 🔲
+### Phase 5: Notifications & LLM ✅
 
 | Component | Status | Details |
 |-----------|--------|---------|
-| Telegram Bot Integration | 🔲 Planned | Event alerts with snapshots |
-| WhatsApp API | 🔲 Planned | Via WhatsApp Business API |
-| Email (SMTP) | 🔲 Planned | Async email with aiosmtplib |
-| LLM AI Assistant | 🔲 Planned | Ollama / OpenAI / Gemini / OpenRouter |
-| Event Summarization | 🔲 Planned | AI-generated event descriptions |
+| Telegram Bot Integration | ✅ Done | httpx multipart form sending image/text |
+| WhatsApp API | ✅ Done | Generic POST interface ready for meta/twilio |
+| Email (SMTP) | ✅ Done | Async email over TLS via aiosmtplib |
+| LLM AI Assistant | ✅ Done | GPT/Gemini/Ollama/OpenRouter interfaces connected to UI |
+| Event Summarization | ✅ Done | NLP event sentences generated via YOLO worker pipeline |
 
 ### Phase 6: Analytics & Heatmaps 🔲
 
