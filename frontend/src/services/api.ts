@@ -106,8 +106,17 @@ export const settingsApi = {
 export const modelsApi = {
     list: () => api.get('/models'),
     available: () => api.get('/models/available'),
+    getActive: () => api.get('/models/active'),
     download: (modelName: string) => api.post('/models/download', { model_name: modelName }),
     setDefault: (id: string) => api.put(`/models/${id}/default`),
+    upload: (file: File, name: string) => {
+        const formData = new FormData();
+        formData.append('file', file);
+        return api.post(`/models/upload?name=${encodeURIComponent(name)}`, formData, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+        });
+    },
+    reloadDeepstream: () => api.post('/models/deepstream/reload'),
     delete: (id: string) => api.delete(`/models/${id}`),
 };
 
