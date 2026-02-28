@@ -1,14 +1,14 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import {
     Box, Typography, Card, CardContent, TextField, Button, Switch,
-    FormControlLabel, Select, MenuItem, FormControl, InputLabel,
-    Tabs, Tab, Stack, Alert, Snackbar, CircularProgress, Chip, Divider,
-    IconButton, InputAdornment, Autocomplete, Grid, Paper,
+    FormControlLabel, Select, MenuItem, FormControl,
+    Tabs, Tab, Stack, Alert, Snackbar, CircularProgress, Chip,
+    IconButton, InputAdornment, Autocomplete, Grid,
 } from '@mui/material';
 import {
     Storage, Notifications, SmartToy, Save, Send, Refresh,
     Telegram, Email, WhatsApp, Visibility, VisibilityOff,
-    FolderOpen, Timer, DeleteForever,
+    FolderOpen, Timer,
 } from '@mui/icons-material';
 import { settingsApi } from '../services/api';
 
