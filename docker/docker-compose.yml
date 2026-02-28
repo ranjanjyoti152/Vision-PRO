@@ -69,7 +69,7 @@ services:
       - ../backend:/app
       - ../backend/models:/models
     ports:
-      - "${DEEPSTREAM_ZMQ_PORT:-5570}:5570"
+      - "${DEEPSTREAM_ZMQ_PORT:-5571}:5570"
     depends_on:
       mongodb:
         condition: service_healthy
