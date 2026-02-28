@@ -10,7 +10,6 @@ import {
     Skeleton,
     Button,
     Dialog,
-    DialogTitle,
     DialogContent,
     DialogActions,
     TextField,
@@ -406,35 +405,166 @@ const Dashboard: React.FC = () => {
 
             {/* Add Camera Dialog */}
             <Dialog open={addDialogOpen} onClose={() => setAddDialogOpen(false)} maxWidth="sm" fullWidth
-                PaperProps={{ sx: { background: '#111827', borderRadius: 3 } }}>
-                <DialogTitle>Add Camera</DialogTitle>
-                <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: '16px !important' }}>
+                PaperProps={{
+                    sx: {
+                        background: 'linear-gradient(180deg, #111827 0%, #0d1117 100%)',
+                        borderRadius: 3,
+                        border: '1px solid rgba(79,142,247,0.15)',
+                        overflow: 'hidden',
+                    },
+                }}>
+                {/* Header with gradient accent */}
+                <Box sx={{
+                    p: 3, pb: 2,
+                    background: 'linear-gradient(135deg, rgba(79,142,247,0.08) 0%, rgba(124,77,255,0.05) 100%)',
+                    borderBottom: '1px solid rgba(148,163,184,0.08)',
+                }}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
+                        <Box sx={{
+                            width: 44, height: 44, borderRadius: 2,
+                            background: 'linear-gradient(135deg, #4F8EF7 0%, #7C4DFF 100%)',
+                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            boxShadow: '0 4px 16px rgba(79,142,247,0.3)',
+                        }}>
+                            <CameraAlt sx={{ fontSize: 22, color: '#fff' }} />
+                        </Box>
+                        <Box>
+                            <Typography variant="h6" sx={{ fontWeight: 700, lineHeight: 1.2 }}>Add Camera</Typography>
+                            <Typography variant="caption" color="text.secondary">
+                                Connect an RTSP camera stream to your NVR
+                            </Typography>
+                        </Box>
+                    </Box>
+                </Box>
+
+                <DialogContent sx={{ p: 3, display: 'flex', flexDirection: 'column', gap: 2.5 }}>
                     {addError && (
-                        <Typography color="error" variant="body2">{addError}</Typography>
+                        <Box sx={{
+                            p: 1.5, borderRadius: 1.5,
+                            background: 'rgba(255,82,82,0.08)',
+                            border: '1px solid rgba(255,82,82,0.2)',
+                            display: 'flex', alignItems: 'center', gap: 1,
+                        }}>
+                            <Typography variant="body2" sx={{ color: '#FF5252', fontSize: '0.8rem' }}>{addError}</Typography>
+                        </Box>
                     )}
-                    <TextField
-                        label="Camera Name" placeholder="e.g. Front Gate"
-                        value={newCamera.name}
-                        onChange={e => setNewCamera({ ...newCamera, name: e.target.value })}
-                        fullWidth size="small"
-                    />
-                    <TextField
-                        label="RTSP URL" placeholder="rtsp://user:pass@192.168.1.100:554/stream"
-                        value={newCamera.rtsp_url}
-                        onChange={e => setNewCamera({ ...newCamera, rtsp_url: e.target.value })}
-                        fullWidth size="small"
-                    />
-                    <TextField
-                        label="Location (optional)" placeholder="e.g. Building A, Floor 2"
-                        value={newCamera.location}
-                        onChange={e => setNewCamera({ ...newCamera, location: e.target.value })}
-                        fullWidth size="small"
-                    />
+
+                    {/* Camera Name */}
+                    <Box>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.8 }}>
+                            <Box sx={{
+                                width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
+                                background: 'rgba(79,142,247,0.15)', border: '1px solid rgba(79,142,247,0.3)',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            }}>
+                                <Typography variant="caption" sx={{ fontSize: '0.6rem', fontWeight: 800, color: '#4F8EF7' }}>1</Typography>
+                            </Box>
+                            <Typography variant="body2" sx={{ fontWeight: 600, fontSize: '0.8rem' }}>Camera Name</Typography>
+                        </Box>
+                        <TextField
+                            placeholder="e.g. Front Gate, Parking Lot"
+                            value={newCamera.name}
+                            onChange={e => setNewCamera({ ...newCamera, name: e.target.value })}
+                            fullWidth size="small"
+                            sx={{
+                                '& .MuiOutlinedInput-root': {
+                                    borderRadius: 2,
+                                    background: 'rgba(255,255,255,0.03)',
+                                    '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(79,142,247,0.4)' },
+                                    '&.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: '#4F8EF7' },
+                                },
+                            }}
+                        />
+                    </Box>
+
+                    {/* RTSP URL */}
+                    <Box>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.8 }}>
+                            <Box sx={{
+                                width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
+                                background: 'rgba(79,142,247,0.15)', border: '1px solid rgba(79,142,247,0.3)',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            }}>
+                                <Typography variant="caption" sx={{ fontSize: '0.6rem', fontWeight: 800, color: '#4F8EF7' }}>2</Typography>
+                            </Box>
+                            <Typography variant="body2" sx={{ fontWeight: 600, fontSize: '0.8rem' }}>RTSP Stream URL</Typography>
+                        </Box>
+                        <TextField
+                            placeholder="rtsp://user:pass@192.168.1.100:554/stream"
+                            value={newCamera.rtsp_url}
+                            onChange={e => setNewCamera({ ...newCamera, rtsp_url: e.target.value })}
+                            fullWidth size="small"
+                            sx={{
+                                '& .MuiOutlinedInput-root': {
+                                    borderRadius: 2, fontFamily: 'monospace', fontSize: '0.85rem',
+                                    background: 'rgba(255,255,255,0.03)',
+                                    '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(79,142,247,0.4)' },
+                                    '&.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: '#4F8EF7' },
+                                },
+                            }}
+                        />
+                        <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block', fontSize: '0.65rem' }}>
+                            Supports RTSP, HTTP, and RTMP streams. Include credentials if required.
+                        </Typography>
+                    </Box>
+
+                    {/* Location */}
+                    <Box>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.8 }}>
+                            <Box sx={{
+                                width: 22, height: 22, borderRadius: '50%', flexShrink: 0,
+                                background: 'rgba(148,163,184,0.1)', border: '1px solid rgba(148,163,184,0.2)',
+                                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                            }}>
+                                <Typography variant="caption" sx={{ fontSize: '0.6rem', fontWeight: 800, color: 'text.secondary' }}>3</Typography>
+                            </Box>
+                            <Typography variant="body2" sx={{ fontWeight: 600, fontSize: '0.8rem' }}>
+                                Location
+                                <Typography variant="caption" color="text.secondary" sx={{ ml: 0.5 }}>(optional)</Typography>
+                            </Typography>
+                        </Box>
+                        <TextField
+                            placeholder="e.g. Building A, Floor 2"
+                            value={newCamera.location}
+                            onChange={e => setNewCamera({ ...newCamera, location: e.target.value })}
+                            fullWidth size="small"
+                            sx={{
+                                '& .MuiOutlinedInput-root': {
+                                    borderRadius: 2,
+                                    background: 'rgba(255,255,255,0.03)',
+                                    '&:hover .MuiOutlinedInput-notchedOutline': { borderColor: 'rgba(79,142,247,0.4)' },
+                                    '&.Mui-focused .MuiOutlinedInput-notchedOutline': { borderColor: '#4F8EF7' },
+                                },
+                            }}
+                        />
+                    </Box>
                 </DialogContent>
-                <DialogActions sx={{ p: 2 }}>
-                    <Button onClick={() => setAddDialogOpen(false)}>Cancel</Button>
+
+                <DialogActions sx={{
+                    p: 2.5, pt: 1,
+                    borderTop: '1px solid rgba(148,163,184,0.08)',
+                }}>
+                    <Button onClick={() => setAddDialogOpen(false)}
+                        sx={{ borderRadius: 2, textTransform: 'none', px: 2.5 }}>
+                        Cancel
+                    </Button>
                     <Button variant="contained" onClick={handleAddCamera}
-                        disabled={!newCamera.name || !newCamera.rtsp_url}>
+                        disabled={!newCamera.name || !newCamera.rtsp_url}
+                        startIcon={<Add />}
+                        sx={{
+                            borderRadius: 2, textTransform: 'none', px: 3,
+                            fontWeight: 700,
+                            background: 'linear-gradient(135deg, #4F8EF7 0%, #7C4DFF 100%)',
+                            boxShadow: '0 4px 12px rgba(79,142,247,0.3)',
+                            '&:hover': {
+                                background: 'linear-gradient(135deg, #3a7be0 0%, #6a3deb 100%)',
+                                boxShadow: '0 6px 20px rgba(79,142,247,0.4)',
+                            },
+                            '&.Mui-disabled': {
+                                background: 'rgba(148,163,184,0.1)',
+                                boxShadow: 'none',
+                            },
+                        }}>
                         Add Camera
                     </Button>
                 </DialogActions>
