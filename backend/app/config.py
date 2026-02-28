@@ -7,11 +7,13 @@ from pathlib import Path
 from pydantic_settings import BaseSettings
 from pydantic import Field
 
+BASE_DIR = Path(__file__).parent.parent.resolve()
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
     # --- App ---
+    BASE_DIR: Path = BASE_DIR
     APP_NAME: str = "Vision Pro Dezine"
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
@@ -46,9 +48,9 @@ class Settings(BaseSettings):
     JWT_EXPIRATION_HOURS: int = 24
 
     # --- Storage Paths ---
-    RECORDING_PATH: str = "./recordings"
-    MODELS_PATH: str = "./models"
-    SNAPSHOT_PATH: str = "./snapshots"
+    RECORDING_PATH: str = str(BASE_DIR / "recordings")
+    MODELS_PATH: str = str(BASE_DIR / "models")
+    SNAPSHOT_PATH: str = str(BASE_DIR / "snapshots")
     STREAM_JPEG_QUALITY: int = 80
     STREAM_MAX_FPS: int = 30
 
@@ -60,7 +62,7 @@ class Settings(BaseSettings):
     DEEPSTREAM_ENABLED: bool = False          # Set True when DeepStream container is running
     DEEPSTREAM_HOST: str = "deepstream"       # Docker service name / hostname
     DEEPSTREAM_ZMQ_PORT: int = 5570          # ZMQ PUSH port from DeepStream container
-    TRT_ENGINE_PATH: str = "./models/yolo/yolov8n.engine"
+    TRT_ENGINE_PATH: str = str(BASE_DIR / "models" / "yolo" / "yolov8n.engine")
     DS_CONF_THRESHOLD: float = 0.45
 
     @property
