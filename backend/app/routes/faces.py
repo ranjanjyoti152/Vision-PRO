@@ -134,18 +134,20 @@ async def upload_reference_image(
         os.remove(filepath)
         raise HTTPException(status_code=500, detail="Failed to indexing face in Qdrant")
 
+    web_path = f"/face_references/{filename}"
+
     await faces_collection().update_one(
         {"_id": ObjectId(face_id)},
         {
             "$push": {
-                "reference_images": filepath,
+                "reference_images": web_path,
                 "embedding_ids": point_id
             },
             "$set": {"updated_at": datetime.now(timezone.utc)},
         },
     )
 
-    return {"message": "Reference image uploaded and face enrolled", "path": filepath, "qdrant_id": point_id}
+    return {"message": "Reference image uploaded and face enrolled", "path": web_path, "qdrant_id": point_id}
 
 
 @router.delete("/{face_id}")

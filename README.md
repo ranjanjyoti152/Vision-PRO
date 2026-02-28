@@ -184,7 +184,11 @@ Vision-Pro/
 │       ├── App.tsx                  # Router + auth guards
 │       └── main.tsx                 # Entry point
 ├── docker/
-│   ├── docker-compose.yml           # MongoDB + Qdrant
+│   ├── docker-compose.yml           # MongoDB + Qdrant + DeepStream (optional profile)
+│   ├── deepstream/                  # NVIDIA DeepStream GPU pipeline
+│   │   ├── Dockerfile               # DeepStream 7.1 image
+│   │   ├── entrypoint.sh            # Auto TRT conversion + pipeline start
+│   │   └── convert_model.sh         # Manual model conversion helper
 │   └── mongo-init.js                # DB initialization
 ├── .env.example                     # Environment template
 └── .gitignore
@@ -199,7 +203,7 @@ Vision-Pro/
 - **Python 3.12+**
 - **Node.js 20+**
 - **Docker & Docker Compose**
-- **NVIDIA GPU** with CUDA drivers (recommended)
+- **NVIDIA GPU** with CUDA 12.x drivers (required for GPU inference)
 
 ### 1. Clone & Configure
 
@@ -207,18 +211,34 @@ Vision-Pro/
 git clone https://github.com/ranjanjyoti152/Vision-PRO.git
 cd Vision-PRO
 cp .env.example .env
-# Edit .env with your MongoDB/Qdrant ports if changed
+# Edit .env with your MongoDB/Qdrant ports if needed
 ```
 
-### 2. Start Databases
+### 2. Start Databases (Standard Mode)
 
 ```bash
 cd docker && docker compose up -d
 ```
 
-This launches:
-- **MongoDB 7** on a random port (check with `docker compose ps`)
-- **Qdrant** (GPU-enabled) on a random port
+Starts only **MongoDB 7** and **Qdrant** (vector DB). The backend runs natively.
+
+### 2b. Start with DeepStream GPU Pipeline (Optional)
+
+> Requires NVIDIA DeepStream 7.1. First run downloads ~4.3 GB image and converts YOLO → TensorRT (~5 min one-time).
+
+```bash
+cd docker && docker compose --profile deepstream up -d
+```
+
+Then enable it in your `.env`:
+```env
+DEEPSTREAM_ENABLED=True
+```
+
+| Mode | Command | GPU Pipeline |
+|------|---------|-------------|
+| **Standard** | `docker compose up -d` | OpenCV + PyTorch YOLO |
+| **DeepStream** | `docker compose --profile deepstream up -d` | nvv4l2decoder + TensorRT |
 
 ### 3. Start Backend
 

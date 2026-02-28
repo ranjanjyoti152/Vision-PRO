@@ -129,6 +129,14 @@ if os.path.exists(settings.SNAPSHOT_PATH):
         name="snapshots",
     )
 
+face_ref_dir = os.path.join(settings.MODELS_PATH, "face_references")
+os.makedirs(face_ref_dir, exist_ok=True)
+app.mount(
+    "/face_references",
+    StaticFiles(directory=face_ref_dir),
+    name="face_references",
+)
+
 
 # Health check
 @app.get("/api/health")

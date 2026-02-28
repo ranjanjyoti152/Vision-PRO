@@ -62,7 +62,10 @@ class StreamHealth:
 class CameraStream:
     """Manages a single RTSP camera stream in a background task."""
 
-    def __init__(self, camera_id: str, rtsp_url: str, target_fps: int = 15):
+    def __init__(self, camera_id: str, rtsp_url: str, target_fps: int = None):
+        if target_fps is None:
+            from app.config import settings
+            target_fps = settings.STREAM_MAX_FPS
         self.camera_id = camera_id
         self.rtsp_url = rtsp_url
         self.target_fps = target_fps
@@ -157,12 +160,18 @@ class CameraStream:
         def _open():
             cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap.set(cv2.CAP_PROP_FPS, self.target_fps)  # Request target FPS from camera
             if cap.isOpened():
-                return cap
+                # Log the actual FPS the camera agreed to
+                actual = cap.get(cv2.CAP_PROP_FPS)
+                return cap, actual
             cap.release()
-            return None
+            return None, 0
 
-        self._cap = await asyncio.to_thread(_open)
+        result = await asyncio.to_thread(_open)
+        self._cap, actual_fps = result
+        if self._cap is not None:
+            logger.info(f"📷 {self.camera_id}: requested {self.target_fps} FPS, camera reports {actual_fps:.1f} FPS")
         return self._cap is not None
 
     async def _read_loop(self) -> None:
@@ -240,8 +249,10 @@ class StreamManager:
         self._streams: Dict[str, CameraStream] = {}
 
     def start_stream(
-        self, camera_id: str, rtsp_url: str, fps: int = 15
+        self, camera_id: str, rtsp_url: str, fps: int = None
     ) -> CameraStream:
+        if fps is None:
+            fps = settings.STREAM_MAX_FPS
         """Start streaming a camera. If already streaming, restart."""
         if camera_id in self._streams:
             # Already running – return existing
@@ -259,8 +270,10 @@ class StreamManager:
             await stream.stop()
 
     async def restart_stream(
-        self, camera_id: str, rtsp_url: str, fps: int = 15
+        self, camera_id: str, rtsp_url: str, fps: int = None
     ) -> CameraStream:
+        if fps is None:
+            fps = settings.STREAM_MAX_FPS
         """Stop and re-start a camera stream."""
         await self.stop_stream(camera_id)
         return self.start_stream(camera_id, rtsp_url, fps)
@@ -297,7 +310,7 @@ class StreamManager:
         count = 0
         for cam in cameras:
             cam_id = str(cam["_id"])
-            fps = min(cam.get("fps", 25), settings.STREAM_MAX_FPS)
+            fps = min(cam.get("fps", settings.STREAM_MAX_FPS), settings.STREAM_MAX_FPS)
             self.start_stream(cam_id, cam["rtsp_url"], fps)
             count += 1
 

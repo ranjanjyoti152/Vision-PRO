@@ -27,6 +27,14 @@ export default defineConfig({
         target: 'http://localhost:8090',
         changeOrigin: true,
       },
+      '/snapshots': {
+        target: 'http://localhost:8090',
+        changeOrigin: true,
+      },
+      '/face_references': {
+        target: 'http://localhost:8090',
+        changeOrigin: true,
+      },
     },
   },
 })

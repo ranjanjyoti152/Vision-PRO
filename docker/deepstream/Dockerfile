@@ -18,9 +18,10 @@ RUN mkdir -p /models/yolo /models/faces
 WORKDIR /app
 
 # Copy DeepStream pipeline package
-COPY app/ /app/app/
+COPY backend/app/ /app/app/
 
 COPY docker/deepstream/entrypoint.sh /entrypoint.sh
+COPY docker/deepstream/convert_model.sh /convert_model.sh
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

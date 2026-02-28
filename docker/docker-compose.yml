@@ -41,12 +41,14 @@ services:
     networks:
       - visionpro-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:6333/healthz"]
       interval: 10s
-      timeout: 5s
-      retries: 5
+      timeout: 10s
+      retries: 10
+      start_period: 30s
 
   deepstream:
+    profiles: ["deepstream"]   # Only starts with: docker compose --profile deepstream up -d
     build:
       context: ..
       dockerfile: docker/deepstream/Dockerfile
@@ -72,7 +74,7 @@ services:
       mongodb:
         condition: service_healthy
       qdrant:
-        condition: service_healthy
+        condition: service_started   # Qdrant is up fast; healthcheck just takes time
     networks:
       - visionpro-net
     deploy:
