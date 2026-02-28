@@ -12,6 +12,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional
+from collections import deque
 from bson import ObjectId
 from dataclasses import dataclass, field
 
@@ -84,6 +85,10 @@ class DetectionWorker:
         
         # camera_id -> CooldownTracker
         self.cooldowns: Dict[str, CooldownTracker] = {}
+        
+        # Frame ring buffer for video clips: camera_id -> deque of (timestamp, frame)
+        self._frame_buffers: Dict[str, deque] = {}
+        self._buffer_max_seconds = 5  # Keep last 5 seconds of frames
 
     def start(self):
         """Start the worker loop."""
@@ -152,6 +157,11 @@ class DetectionWorker:
             frame = stream_manager.get_raw_frame(cam_id)
             if frame is None:
                 continue
+
+            # Buffer frame for video clip generation
+            if cam_id not in self._frame_buffers:
+                self._frame_buffers[cam_id] = deque(maxlen=150)  # ~5s at 30fps
+            self._frame_buffers[cam_id].append((time.time(), frame.copy()))
 
             # Run inference in a thread pool to avoid blocking the asyncio loop
             results = await asyncio.to_thread(self.engine.predict, frame)
@@ -369,7 +379,12 @@ class DetectionWorker:
         event_oid = result_insert.inserted_id
         logger.info(f"🚨 Event generated: {event_type.value} on camera {cam_id} ({confidence:.2f})")
         
-        # 3. Enqueue AI summary for sequential processing
+        # 3. Save video clip from ring buffer (non-blocking)
+        asyncio.create_task(
+            self._save_video_clip(cam_id, event_uuid, event_oid, raw_frame)
+        )
+        
+        # 4. Enqueue AI summary for sequential processing
         llm_service.enqueue_summary(
             event_oid=event_oid,
             event_type=event_type,
@@ -446,6 +461,101 @@ class DetectionWorker:
             detected_objs=detected_objs,
             jpeg=jpeg,
         )
+
+    async def _save_video_clip(
+        self, cam_id: str, event_uuid: str, event_oid, current_frame: np.ndarray
+    ) -> None:
+        """Write buffered frames + post-event frames to a browser-compatible WebM clip."""
+        try:
+            from app.database import events_collection
+
+            clip_filename = f"{cam_id}_{event_uuid}.webm"
+            clip_path = settings.RECORDING_DIR / clip_filename
+
+            # Grab buffered pre-event frames
+            buffer = self._frame_buffers.get(cam_id)
+            if not buffer or len(buffer) < 2:
+                return
+
+            # Record the actual start time from the buffer
+            start_time = datetime.fromtimestamp(buffer[0][0], tz=timezone.utc)
+            frames = [f.copy() for _, f in buffer]
+
+            # Estimate FPS from buffer timestamps
+            timestamps = [t for t, _ in buffer]
+            time_span = timestamps[-1] - timestamps[0]
+            est_fps = max(5.0, len(timestamps) / max(time_span, 0.1))
+            fps = min(est_fps, 30.0)  # Cap at 30fps
+
+            # Capture 3 more seconds of post-event frames
+            post_frames = int(fps * 3)
+            interval = 1.0 / fps
+            for _ in range(post_frames):
+                await asyncio.sleep(interval)
+                frame = stream_manager.get_raw_frame(cam_id)
+                if frame is not None:
+                    frames.append(frame.copy())
+
+            end_time = datetime.now(timezone.utc)
+            actual_duration = len(frames) / fps
+
+            # Write video using VP8 codec in WebM container (browser-native)
+            result_info = [clip_filename, clip_path]  # mutable container for inner fn
+
+            def write_clip():
+                h, w = frames[0].shape[:2]
+                out_filename = result_info[0]
+                out_path = result_info[1]
+                # Try VP8 first (WebM)
+                fourcc = cv2.VideoWriter_fourcc(*'VP80')
+                writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+                if not writer.isOpened():
+                    fourcc = cv2.VideoWriter_fourcc(*'vp08')
+                    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+                if not writer.isOpened():
+                    # Fallback: XVID in AVI
+                    out_filename = f"{cam_id}_{event_uuid}.avi"
+                    out_path = settings.RECORDING_DIR / out_filename
+                    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+                    result_info[0] = out_filename
+                    result_info[1] = out_path
+                for f in frames:
+                    if f.shape[:2] == (h, w):
+                        writer.write(f)
+                writer.release()
+
+            await asyncio.to_thread(write_clip)
+
+            # Read back possibly-updated filename/path from inner fn
+            clip_filename = result_info[0]
+            clip_path = result_info[1]
+
+            # Update event document with clip path
+            clip_url = f"/recordings/{clip_filename}"
+            await events_collection().update_one(
+                {"_id": event_oid},
+                {"$set": {"video_clip_path": clip_url}}
+            )
+
+            # Also insert a recording document so it shows in recordings list
+            from app.database import recordings_collection
+            rec_doc = {
+                "camera_id": cam_id,
+                "file_path": str(clip_path),
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration_seconds": actual_duration,
+                "file_size_bytes": clip_path.stat().st_size if clip_path.exists() else 0,
+                "trigger_event_id": event_oid,
+                "created_at": datetime.now(timezone.utc),
+            }
+            await recordings_collection().insert_one(rec_doc)
+
+            logger.info(f"🎬 Video clip saved: {clip_filename} ({len(frames)} frames, {actual_duration:.1f}s)")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to save video clip: {e}")
 
     async def _create_event_from_jpeg(
         self,

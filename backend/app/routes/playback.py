@@ -2,7 +2,7 @@
 Playback / Recording routes.
 """
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from fastapi.responses import FileResponse
 from bson import ObjectId
 import os
@@ -110,9 +110,9 @@ async def get_recording_calendar(
 @router.get("/{recording_id}/stream")
 async def stream_recording(
     recording_id: str,
-    user: dict = Depends(get_current_user),
+    request: Request,
 ):
-    """Stream a recording file."""
+    """Stream a recording file. No auth required for video element access."""
     rec = await recordings_collection().find_one({"_id": ObjectId(recording_id)})
     if not rec:
         raise HTTPException(status_code=404, detail="Recording not found")
@@ -121,9 +121,14 @@ async def stream_recording(
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="Recording file not found on disk")
 
+    # Auto-detect media type from extension
+    ext = os.path.splitext(filepath)[1].lower()
+    media_types = {'.webm': 'video/webm', '.mp4': 'video/mp4', '.avi': 'video/x-msvideo'}
+    media_type = media_types.get(ext, 'video/mp4')
+
     return FileResponse(
         filepath,
-        media_type="video/mp4",
+        media_type=media_type,
         filename=os.path.basename(filepath),
     )
 

@@ -153,10 +153,18 @@ const Playback: React.FC = () => {
     // Get stream URL for a recording or event
     const getStreamUrl = (rec: any) => {
         if (rec.type === 'event') {
-            // Events have snapshot_path which is served as static files
-            return rec.snapshot_path || '';
+            // Prefer video clip over snapshot
+            if (rec.video_clip_path) {
+                return `${API_BASE}${rec.video_clip_path.startsWith('/') ? '' : '/'}${rec.video_clip_path}`;
+            }
+            return '';
         }
         return `${API_BASE}/api/recordings/${rec.id}/stream`;
+    };
+
+    const hasVideo = (rec: any) => {
+        if (rec.type === 'event') return Boolean(rec.video_clip_path);
+        return true;
     };
 
     // Video controls
@@ -424,13 +432,7 @@ const Playback: React.FC = () => {
                             <Box>
                                 {/* Video or Image */}
                                 <Box sx={{ position: 'relative', background: '#000', aspectRatio: '16/9' }}>
-                                    {activeRecording.type === 'event' ? (
-                                        <img
-                                            src={`${API_BASE}${activeRecording.snapshot_path?.startsWith('/') ? '' : '/'}${activeRecording.snapshot_path}`}
-                                            alt={activeRecording.event_type}
-                                            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
-                                        />
-                                    ) : (
+                                    {hasVideo(activeRecording) ? (
                                         <video
                                             ref={videoRef}
                                             src={getStreamUrl(activeRecording)}
@@ -442,6 +444,12 @@ const Playback: React.FC = () => {
                                             onPlay={() => setPlaying(true)}
                                             onPause={() => setPlaying(false)}
                                             onEnded={() => setPlaying(false)}
+                                        />
+                                    ) : (
+                                        <img
+                                            src={`${API_BASE}${activeRecording.snapshot_path?.startsWith('/') ? '' : '/'}${activeRecording.snapshot_path}`}
+                                            alt={activeRecording.event_type}
+                                            style={{ width: '100%', height: '100%', objectFit: 'contain' }}
                                         />
                                     )}
                                     {/* Camera name overlay */}
