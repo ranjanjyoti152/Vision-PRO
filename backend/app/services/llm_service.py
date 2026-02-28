@@ -2,6 +2,7 @@
 LLM Service for generating event summaries and handling assistant chats.
 Supports multiple providers: Ollama, OpenAI, Gemini, OpenRouter.
 """
+import asyncio
 import logging
 import httpx
 from typing import Dict, Any, List, Optional
@@ -11,10 +12,62 @@ from app.models.event import EventType, DetectedObject
 
 logger = logging.getLogger(__name__)
 
+# Max pending summaries in queue — oldest are dropped when full
+_QUEUE_MAX = 20
+
 
 class LLMService:
     def __init__(self):
-        self.timeout = httpx.Timeout(15.0)
+        self.timeout = httpx.Timeout(60.0, connect=10.0)
+        self._queue: asyncio.Queue | None = None
+        self._worker_task: asyncio.Task | None = None
+
+    def _ensure_queue(self):
+        """Lazily create queue + worker on the running event loop."""
+        if self._queue is None:
+            self._queue = asyncio.Queue(maxsize=_QUEUE_MAX)
+            self._worker_task = asyncio.create_task(self._queue_worker())
+            logger.info("📝 LLM summary queue started (max=%d)", _QUEUE_MAX)
+
+    async def _queue_worker(self):
+        """Process summary jobs one at a time, sequentially."""
+        while True:
+            job = await self._queue.get()
+            try:
+                event_oid = job["event_oid"]
+                event_type = job["event_type"]
+                confidence = job["confidence"]
+                objects = job["objects"]
+                face_name = job.get("face_name")
+
+                ai_summary = await self.generate_event_summary(
+                    event_type, confidence, objects, face_name
+                )
+                if ai_summary and ai_summary not in ("Event detected.", ""):
+                    from app.database import events_collection
+                    await events_collection().update_one(
+                        {"_id": event_oid}, {"$set": {"ai_summary": ai_summary}}
+                    )
+                    logger.debug(f"✅ Summary updated for event {event_oid}")
+            except Exception as e:
+                logger.debug(f"Summary queue job failed: {e}")
+            finally:
+                self._queue.task_done()
+
+    def enqueue_summary(self, event_oid, event_type, confidence, objects, face_name=None):
+        """Add a summary job to the queue. Drops silently if queue is full."""
+        self._ensure_queue()
+        try:
+            self._queue.put_nowait({
+                "event_oid": event_oid,
+                "event_type": event_type,
+                "confidence": confidence,
+                "objects": objects,
+                "face_name": face_name,
+            })
+            logger.debug(f"📝 Queued summary (pending: {self._queue.qsize()})")
+        except asyncio.QueueFull:
+            logger.debug("📝 Summary queue full, skipping")
 
     async def _get_llm_settings(self) -> Dict[str, Any]:
         """Fetch all LLM settings from the database and decrypt keys."""
@@ -75,20 +128,31 @@ class LLMService:
 
     async def _generate_text(self, prompt: str, fallback: str) -> str:
         """Internal helper to call the active LLM with a single prompt."""
+        provider = "unknown"
         try:
             settings = await self._get_llm_settings()
             provider = settings.get("active_provider")
             
             if not provider:
-                logger.debug("No active LLM provider configured, using fallback summary.")
                 return fallback
+
+            model_key = f"{provider}_default_model"
+            model = settings.get(model_key, "unknown")
+            logger.debug(f"Calling {provider}/{model} for event summary")
                 
             messages = [{"role": "user", "content": prompt}]
             result = await self._call_provider(provider, settings, messages)
             return result.strip() if result else fallback
             
+        except httpx.TimeoutException:
+            logger.warning(f"LLM request timed out ({provider})")
+            return fallback
+        except httpx.HTTPStatusError as e:
+            logger.error(f"LLM HTTP error ({provider}): {e.response.status_code} - {e.response.text[:200]}")
+            return fallback
         except Exception as e:
-            logger.error(f"Failed to generate LLM text: {e}")
+            err_msg = str(e) or type(e).__name__
+            logger.error(f"Failed to generate LLM text ({provider}): {err_msg}")
             return fallback
 
     async def _call_provider(self, provider: str, settings: Dict[str, Any], messages: List[Dict[str, str]]) -> str:

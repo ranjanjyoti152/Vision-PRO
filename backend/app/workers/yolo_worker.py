@@ -339,20 +339,16 @@ class DetectionWorker:
             cv2.imwrite, str(snapshot_abs_path), annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 85]
         )
         
-        # 2. Get AI Summary from LLM Service
+        # 2. Construct DB Event (insert immediately with default summary)
         face_name = None
         if face_id:
             from app.database import faces_collection
             face_doc = await faces_collection().find_one({"_id": ObjectId(face_id)})
             if face_doc:
                 face_name = face_doc.get("name")
-                
-        ai_summary = await llm_service.generate_event_summary(
-            event_type, confidence, [obj.model_dump(by_alias=True) for obj in detected_objs], face_name
-        )
-        
-        # 3. Construct DB Event
+
         now = datetime.now(timezone.utc)
+        default_summary = f"{event_type.value} detected" + (f" ({face_name})" if face_name else "")
         
         event_doc = {
             "camera_id": cam_id,
@@ -360,22 +356,31 @@ class DetectionWorker:
             "confidence": confidence,
             "timestamp": now,
             "snapshot_path": f"/snapshots/{snapshot_filename}",
-            "video_clip_path": "",  # To be filled by Recording worker later
+            "video_clip_path": "",
             "bounding_box": primary_bbox.model_dump(),
-            "ai_summary": ai_summary,
+            "ai_summary": default_summary,
             "detected_objects": [obj.model_dump(by_alias=True) for obj in detected_objs],
             "face_id": ObjectId(face_id) if face_id else None,
             "metadata": {},
             "created_at": now,
         }
         
-        await events_collection().insert_one(event_doc)
+        result_insert = await events_collection().insert_one(event_doc)
+        event_oid = result_insert.inserted_id
         logger.info(f"🚨 Event generated: {event_type.value} on camera {cam_id} ({confidence:.2f})")
         
-        # 4. Dispatch Notifications
-        # Fire and forget (don't wait for completion) to avoid blocking the detection loop
+        # 3. Enqueue AI summary for sequential processing
+        llm_service.enqueue_summary(
+            event_oid=event_oid,
+            event_type=event_type,
+            confidence=confidence,
+            objects=[obj.model_dump(by_alias=True) for obj in detected_objs],
+            face_name=face_name,
+        )
+        
+        # 4. Dispatch Notifications (fire and forget)
         asyncio.create_task(
-            notification_service.dispatch(ai_summary, str(snapshot_abs_path))
+            notification_service.dispatch(default_summary, str(snapshot_abs_path))
         )
 
     async def handle_deepstream_event(
@@ -462,10 +467,7 @@ class DetectionWorker:
         if jpeg:
             await asyncio.to_thread(snapshot_abs_path.write_bytes, jpeg)
 
-        ai_summary = await llm_service.generate_event_summary(
-            event_type, confidence, [obj.model_dump(by_alias=True) for obj in detected_objs]
-        )
-
+        default_summary = f"{event_type.value} detected"
         now = datetime.now(timezone.utc)
         event_doc = {
             "camera_id":       cam_id,
@@ -475,19 +477,28 @@ class DetectionWorker:
             "snapshot_path":   f"/snapshots/{snapshot_filename}" if jpeg else "",
             "video_clip_path": "",
             "bounding_box":    primary_bbox.model_dump(),
-            "ai_summary":      ai_summary,
+            "ai_summary":      default_summary,
             "detected_objects": [obj.model_dump(by_alias=True) for obj in detected_objs],
             "face_id":         None,
             "metadata":        {"source": "deepstream"},
             "created_at":      now,
         }
 
-        await events_collection().insert_one(event_doc)
+        result_insert = await events_collection().insert_one(event_doc)
+        event_oid = result_insert.inserted_id
         logger.info(f"🚨 [DeepStream] Event: {event_type.value} on cam {cam_id} ({confidence:.2f})")
+
+        # Enqueue AI summary for sequential processing
+        llm_service.enqueue_summary(
+            event_oid=event_oid,
+            event_type=event_type,
+            confidence=confidence,
+            objects=[obj.model_dump(by_alias=True) for obj in detected_objs],
+        )
 
         if jpeg:
             asyncio.create_task(
-                notification_service.dispatch(ai_summary, str(snapshot_abs_path))
+                notification_service.dispatch(default_summary, str(snapshot_abs_path))
             )
 
 
