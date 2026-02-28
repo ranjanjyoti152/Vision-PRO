@@ -49,7 +49,7 @@ async def _enrich_event(event: dict) -> EventResponse:
     )
 
 
-@router.get("", response_model=list[EventResponse])
+@router.get("")
 async def list_events(
     camera_id: str | None = Query(None),
     event_type: EventType | None = Query(None),
@@ -76,6 +76,7 @@ async def list_events(
     if min_confidence > 0:
         query["confidence"] = {"$gte": min_confidence}
 
+    total = await events_collection().count_documents(query)
     skip = (page - 1) * page_size
     cursor = (
         events_collection()
@@ -85,7 +86,14 @@ async def list_events(
         .limit(page_size)
     )
     events = await cursor.to_list(length=page_size)
-    return [await _enrich_event(e) for e in events]
+    enriched = [await _enrich_event(e) for e in events]
+    return {
+        "events": [e.model_dump(by_alias=True) for e in enriched],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": max(1, -(-total // page_size)),
+    }
 
 
 @router.get("/count")

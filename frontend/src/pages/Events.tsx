@@ -71,10 +71,9 @@ const Events: React.FC = () => {
             };
             if (typeFilter !== 'all') params.event_type = typeFilter;
             const res = await eventsApi.list(params);
-            const data = Array.isArray(res.data) ? res.data : res.data.events || [];
+            const data = res.data?.events || (Array.isArray(res.data) ? res.data : []);
             setEvents(data);
-            // If the API returns a total, use it; otherwise estimate
-            setTotal(res.data.total || data.length);
+            setTotal(res.data?.total || data.length);
         } catch {
             setEvents([]);
         }
