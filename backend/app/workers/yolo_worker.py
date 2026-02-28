@@ -239,9 +239,16 @@ class DetectionWorker:
                     if matched_id:
                         face_id = matched_id
                         highest_conf_class = EventType.FACE_KNOWN
+                        update_fields: dict = {"last_seen": datetime.now(timezone.utc)}
+                        # Save face crop thumbnail if face doesn't have one yet
+                        face_doc = await faces_collection().find_one({"_id": ObjectId(face_id)})
+                        if face_doc and not face_doc.get("thumbnail"):
+                            crop_path = self._save_face_crop(crop, face_id)
+                            if crop_path:
+                                update_fields["thumbnail"] = crop_path
                         await faces_collection().update_one(
                             {"_id": ObjectId(face_id)},
-                            {"$set": {"last_seen": datetime.now(timezone.utc)}, "$inc": {"total_appearances": 1}}
+                            {"$set": update_fields, "$inc": {"total_appearances": 1}}
                         )
                     else:
                         highest_conf_class = EventType.FACE_UNKNOWN
@@ -251,6 +258,7 @@ class DetectionWorker:
                             "is_known": False,
                             "reference_images": [],
                             "embedding_ids": [],
+                            "thumbnail": None,
                             "first_seen": now_utc,
                             "last_seen": now_utc,
                             "total_appearances": 1,
@@ -260,6 +268,14 @@ class DetectionWorker:
                         insert_res = await faces_collection().insert_one(doc)
                         face_id = str(insert_res.inserted_id)
                         
+                        # Save face crop thumbnail
+                        crop_path = self._save_face_crop(crop, face_id)
+                        if crop_path:
+                            await faces_collection().update_one(
+                                {"_id": insert_res.inserted_id},
+                                {"$set": {"thumbnail": crop_path}}
+                            )
+                        
                         point_id = await asyncio.to_thread(face_engine.enroll_face, face_id, embedding)
                         if point_id:
                             await faces_collection().update_one(
@@ -267,7 +283,28 @@ class DetectionWorker:
                                 {"$push": {"embedding_ids": point_id}}
                             )
 
+
         await self._create_event(cam_id, highest_conf_class, highest_conf, primary_bbox, detected_objs, frame, result, face_id)
+
+    def _save_face_crop(self, crop: np.ndarray, face_id: str) -> Optional[str]:
+        """Save a face crop image to disk and return its web-accessible path."""
+        try:
+            face_crops_dir = os.path.join(os.path.dirname(settings.SNAPSHOT_PATH), "face_crops")
+            os.makedirs(face_crops_dir, exist_ok=True)
+            filename = f"{face_id}.jpg"
+            filepath = os.path.join(face_crops_dir, filename)
+            # Resize to a consistent thumbnail size
+            h, w = crop.shape[:2]
+            target_size = 200
+            if h > 0 and w > 0:
+                scale = target_size / max(h, w)
+                new_w, new_h = int(w * scale), int(h * scale)
+                resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                cv2.imwrite(filepath, resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                return f"/face_crops/{filename}"
+        except Exception as e:
+            logger.error(f"Failed to save face crop for {face_id}: {e}")
+        return None
 
     def _map_class_to_event_type(self, yolo_class: str) -> EventType:
         """Map raw COCO class names to generic internal event types."""

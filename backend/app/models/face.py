@@ -21,6 +21,7 @@ class FaceResponse(BaseModel):
     id: str
     name: Optional[str] = None
     is_known: bool
+    thumbnail: Optional[str] = None
     reference_images: list[str] = []
     embedding_ids: list[str] = []
     first_seen: Optional[datetime] = None

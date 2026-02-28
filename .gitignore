@@ -47,4 +47,6 @@ docker/data/
 snapshots/
 backend/snapshots/
 backend/models/
+backend/face_crops/
+face_crops/
 *.pt

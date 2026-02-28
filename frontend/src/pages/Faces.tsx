@@ -162,7 +162,7 @@ const Faces: React.FC = () => {
                 <Grid container spacing={2}>
                     {(loading ? Array(8).fill(null) : faces).map((face, i) => {
                         const color = avatarColor(face?.id || String(i));
-                        const hasRefImage = face?.reference_images?.length > 0;
+                        const faceImg = face?.thumbnail || face?.reference_images?.[0];
 
                         return (
                             <Grid size={{ xs: 6, sm: 4, md: 3, lg: 2 }} key={face?.id || i}>
@@ -181,9 +181,9 @@ const Faces: React.FC = () => {
                                     <CardContent sx={{ p: 2.5 }}>
                                         {loading ? (
                                             <Skeleton variant="circular" width={72} height={72} sx={{ mx: 'auto', mb: 1.5 }} />
-                                        ) : hasRefImage ? (
+                                        ) : faceImg ? (
                                             <Avatar
-                                                src={face.reference_images[0]}
+                                                src={faceImg}
                                                 sx={{ width: 72, height: 72, mx: 'auto', mb: 1.5, border: `2px solid ${color}` }}
                                             />
                                         ) : (
@@ -254,7 +254,7 @@ const Faces: React.FC = () => {
                                     color: avatarColor(detailFace.id),
                                     fontSize: '2rem', fontWeight: 700,
                                 }}
-                                    src={detailFace.reference_images?.[0] || undefined}
+                                    src={detailFace.thumbnail || detailFace.reference_images?.[0] || undefined}
                                 >
                                     {detailFace.is_known ? (detailFace.name || '?')[0].toUpperCase() : '?'}
                                 </Avatar>

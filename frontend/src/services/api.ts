@@ -100,6 +100,8 @@ export const settingsApi = {
         api.post('/settings/notifications/test', { provider }),
     getLLM: () => api.get('/settings/llm'),
     updateLLM: (data: any) => api.put('/settings/llm', data),
+    fetchModels: (provider: string, baseUrl?: string, apiKey?: string) =>
+        api.get(`/settings/llm/models/${provider}`, { params: { base_url: baseUrl, api_key: apiKey } }),
 };
 
 // --- AI Models API ---

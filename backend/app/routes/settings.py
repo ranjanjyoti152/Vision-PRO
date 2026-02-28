@@ -119,3 +119,72 @@ async def update_llm_settings(
 
     await _save_settings_dict("llm", flat)
     return {"message": "LLM settings updated"}
+
+
+@router.get("/llm/models/{provider}")
+async def fetch_provider_models(
+    provider: str,
+    base_url: str = "",
+    api_key: str = "",
+    user: dict = Depends(get_current_user),
+):
+    """Fetch available models from an LLM provider API."""
+    import httpx
+
+    models: list[str] = []
+    timeout = httpx.Timeout(10.0)
+
+    try:
+        if provider == "ollama":
+            url = (base_url or "http://localhost:11434").rstrip("/")
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(f"{url}/api/tags")
+                resp.raise_for_status()
+                data = resp.json()
+                models = [m["name"] for m in data.get("models", [])]
+
+        elif provider == "openai":
+            url = (base_url or "https://api.openai.com/v1").rstrip("/")
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(f"{url}/models", headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                all_models = [m["id"] for m in data.get("data", [])]
+                # Filter to chat models
+                chat_prefixes = ("gpt-", "o1", "o3", "o4")
+                models = sorted([m for m in all_models if any(m.startswith(p) for p in chat_prefixes)])
+                if not models:
+                    models = sorted(all_models)
+
+        elif provider == "gemini":
+            if not api_key:
+                raise HTTPException(400, "API key required for Gemini")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                data = resp.json()
+                models = sorted([
+                    m["name"].replace("models/", "")
+                    for m in data.get("models", [])
+                    if "generateContent" in str(m.get("supportedGenerationMethods", []))
+                ])
+
+        elif provider == "openrouter":
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                headers = {}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                resp = await client.get("https://openrouter.ai/api/v1/models", headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+                models = sorted([m["id"] for m in data.get("data", [])])
+
+        else:
+            raise HTTPException(400, f"Unknown provider: {provider}")
+
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Failed to fetch models from {provider}: {str(e)}")
+
+    return {"provider": provider, "models": models}

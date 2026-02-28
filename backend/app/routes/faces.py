@@ -28,6 +28,7 @@ def _face_doc_to_response(face: dict) -> FaceResponse:
         id=str(face["_id"]),
         name=face.get("name"),
         is_known=face.get("is_known", False),
+        thumbnail=face.get("thumbnail"),
         reference_images=face.get("reference_images", []),
         embedding_ids=face.get("embedding_ids", []),
         first_seen=face.get("first_seen"),

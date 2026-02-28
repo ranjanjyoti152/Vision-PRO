@@ -137,6 +137,14 @@ app.mount(
     name="face_references",
 )
 
+face_crops_dir = os.path.join(os.path.dirname(settings.SNAPSHOT_PATH), "face_crops")
+os.makedirs(face_crops_dir, exist_ok=True)
+app.mount(
+    "/face_crops",
+    StaticFiles(directory=face_crops_dir),
+    name="face_crops",
+)
+
 
 # Health check
 @app.get("/api/health")
