@@ -162,7 +162,7 @@ async def reload_deepstream(admin: dict = Depends(require_admin)):
     Requires the Docker socket to be mounted: /var/run/docker.sock
     """
     if not settings.DEEPSTREAM_ENABLED:
-        raise HTTPException(status_code=400, detail="DeepStream is not enabled")
+        return {"message": "DeepStream is not enabled — using OpenCV pipeline", "status": "skipped"}
 
     try:
         import docker  # pip install docker
