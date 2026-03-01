@@ -26,6 +26,13 @@ async def lifespan(app: FastAPI):
     """Application startup and shutdown lifecycle."""
     logger.info(f"🚀 Starting {settings.APP_NAME} v{settings.APP_VERSION}")
 
+    # Ensure all runtime directories exist (critical for fresh clones)
+    for d in [settings.RECORDING_DIR, settings.SNAPSHOT_DIR,
+              settings.MODELS_DIR, settings.YOLO_MODELS_DIR, settings.FACE_MODELS_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+    face_crops = settings.BASE_DIR / "face_crops"
+    face_crops.mkdir(parents=True, exist_ok=True)
+
     # Connect databases
     await connect_db()
     await connect_qdrant()

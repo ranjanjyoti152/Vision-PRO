@@ -23,8 +23,27 @@ models/yolo/*.pt
 models/yolo/*.onnx
 models/faces/*.onnx
 
-# Recordings
-recordings/
+# Recordings — ignore contents, keep directory
+backend/recordings/*
+!backend/recordings/.gitkeep
+
+# Snapshots — ignore contents, keep directory
+backend/snapshots/*
+!backend/snapshots/.gitkeep
+
+# Models — ignore large binaries, keep directory structure
+backend/models/yolo/*.pt
+backend/models/yolo/*.onnx
+backend/models/yolo/*.engine
+backend/models/faces/*.onnx
+backend/models/face_references/*
+!backend/models/.gitkeep
+!backend/models/yolo/.gitkeep
+!backend/models/faces/.gitkeep
+
+# Face crops — ignore contents, keep directory
+backend/face_crops/*
+!backend/face_crops/.gitkeep
 
 # IDE
 .vscode/
@@ -43,10 +62,6 @@ logs/
 # Docker volumes
 docker/data/
 
-# Runtime-generated data (snapshots, model downloads)
-snapshots/
-backend/snapshots/
-backend/models/
-backend/face_crops/
-face_crops/
+# Runtime
 *.pt
+!backend/models/.gitkeep

@@ -158,14 +158,31 @@ class CameraStream:
         self._release_capture()
 
         def _open():
+            # Suppress noisy ffmpeg decode warnings & force TCP for RTSP
+            import os
+            os.environ.setdefault('OPENCV_FFMPEG_LOGLEVEL', '-8')  # AV_LOG_QUIET
+            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+
             cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            # Use TCP transport to avoid UDP packet loss causing h264 decode errors
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FPS, self.target_fps)  # Request target FPS from camera
+            cap.set(cv2.CAP_PROP_FPS, self.target_fps)
             if cap.isOpened():
-                # Log the actual FPS the camera agreed to
                 actual = cap.get(cv2.CAP_PROP_FPS)
                 return cap, actual
             cap.release()
+
+            # Retry with TCP transport option in URL
+            rtsp_tcp = self.rtsp_url
+            if '?' not in rtsp_tcp:
+                rtsp_tcp += '?tcp'
+            cap2 = cv2.VideoCapture(rtsp_tcp, cv2.CAP_FFMPEG)
+            cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            cap2.set(cv2.CAP_PROP_FPS, self.target_fps)
+            if cap2.isOpened():
+                actual = cap2.get(cv2.CAP_PROP_FPS)
+                return cap2, actual
+            cap2.release()
             return None, 0
 
         result = await asyncio.to_thread(_open)

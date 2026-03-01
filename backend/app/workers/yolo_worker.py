@@ -561,7 +561,7 @@ class DetectionWorker:
         try:
             from app.database import events_collection
 
-            clip_filename = f"{cam_id}_{event_uuid}.webm"
+            clip_filename = f"{cam_id}_{event_uuid}.mp4"
             clip_path = settings.RECORDING_DIR / clip_filename
 
             # Grab buffered pre-event frames
@@ -598,12 +598,9 @@ class DetectionWorker:
                 h, w = frames[0].shape[:2]
                 out_filename = result_info[0]
                 out_path = result_info[1]
-                # Try VP8 first (WebM)
-                fourcc = cv2.VideoWriter_fourcc(*'VP80')
+                # Use mp4v codec in MP4 container (universally supported)
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-                if not writer.isOpened():
-                    fourcc = cv2.VideoWriter_fourcc(*'vp08')
-                    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
                 if not writer.isOpened():
                     # Fallback: XVID in AVI
                     out_filename = f"{cam_id}_{event_uuid}.avi"
