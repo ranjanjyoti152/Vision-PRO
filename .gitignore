@@ -37,6 +37,8 @@ backend/models/yolo/*.onnx
 backend/models/yolo/*.engine
 backend/models/faces/*.onnx
 backend/models/face_references/*
+backend/models/active_model.json
+backend/models/models/
 !backend/models/.gitkeep
 !backend/models/yolo/.gitkeep
 !backend/models/faces/.gitkeep
