@@ -1,12 +1,12 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
     Box, Typography, IconButton, Paper, Tooltip, Chip,
-    Select, MenuItem, FormControl, InputLabel, TextField,
+    Select, MenuItem, FormControl, TextField,
     Switch, FormControlLabel, Button, Dialog,
     DialogTitle, DialogContent, DialogActions, Fade,
 } from '@mui/material';
 import {
-    Crop, Add, Delete, Edit, Save, Close, Visibility,
+    Crop, Add, Delete, Edit, Save, Visibility,
     VisibilityOff, NotificationsActive, NotificationsOff,
     PhotoCamera, Undo, CheckCircle, Warning,
     Login as EnterIcon, Logout as ExitIcon, Timer, SwapHoriz,
