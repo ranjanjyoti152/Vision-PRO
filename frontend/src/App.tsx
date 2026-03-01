@@ -15,6 +15,7 @@ import AIAssistant from './pages/AIAssistant';
 import Heatmaps from './pages/Heatmaps';
 import Analytics from './pages/Analytics';
 import Users from './pages/Users';
+import ROIZones from './pages/ROIZones';
 
 const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const token = localStorage.getItem('visionpro_token');
@@ -46,6 +47,7 @@ const App: React.FC = () => {
             <Route path="/users" element={<Users />} />
             <Route path="/assistant" element={<AIAssistant />} />
             <Route path="/heatmaps" element={<Heatmaps />} />
+            <Route path="/roi-zones" element={<ROIZones />} />
             <Route path="/analytics" element={<Analytics />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />

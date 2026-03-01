@@ -32,6 +32,7 @@ import {
     Logout as LogoutIcon,
     FiberManualRecord as LiveDot,
     PeopleAlt as UsersIcon,
+    Crop as CropIcon,
 } from '@mui/icons-material';
 
 const DRAWER_WIDTH = 260;
@@ -42,6 +43,7 @@ const navItems = [
     { label: 'Events', icon: <EventIcon />, path: '/events' },
     { label: 'Faces', icon: <FaceIcon />, path: '/faces' },
     { label: 'Heatmaps', icon: <HeatmapIcon />, path: '/heatmaps' },
+    { label: 'ROI Zones', icon: <CropIcon />, path: '/roi-zones' },
     { label: 'Analytics', icon: <AnalyticsIcon />, path: '/analytics' },
     { label: 'AI Assistant', icon: <ChatIcon />, path: '/assistant' },
     { label: 'AI Models', icon: <AIIcon />, path: '/models' },

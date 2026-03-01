@@ -90,6 +90,12 @@ class DetectionWorker:
         self._frame_buffers: Dict[str, deque] = {}
         self._buffer_max_seconds = 5  # Keep last 5 seconds of frames
 
+        # ROI zone cache: camera_id -> list of zone dicts
+        self._roi_cache: Dict[str, list] = {}
+        self._roi_cache_time: float = 0
+        self._roi_cache_ttl: float = 30  # Refresh every 30 seconds
+        self._roi_cooldowns: Dict[str, float] = {}  # zone_id -> last trigger time
+
     def start(self):
         """Start the worker loop."""
         if self._running:
@@ -223,6 +229,9 @@ class DetectionWorker:
                 
         if not detected_objs:
             return
+
+        # ── ROI Zone Check ─────────────────────────────────────────
+        await self._check_roi_zones(cam_id, detected_objs, frame)
             
         # Cooldown passed -> Create Event
         face_id = None
@@ -315,6 +324,89 @@ class DetectionWorker:
         except Exception as e:
             logger.error(f"Failed to save face crop for {face_id}: {e}")
         return None
+
+    async def _load_roi_zones(self, cam_id: str) -> list:
+        """Load ROI zones for a camera, with caching."""
+        import time as _time
+        now = _time.time()
+        if now - self._roi_cache_time > self._roi_cache_ttl:
+            # Refresh full cache
+            from app.database import roi_zones_collection
+            cursor = roi_zones_collection().find({"enabled": True})
+            all_zones = await cursor.to_list(length=500)
+            self._roi_cache.clear()
+            for z in all_zones:
+                cid = z.get("camera_id", "")
+                if cid not in self._roi_cache:
+                    self._roi_cache[cid] = []
+                self._roi_cache[cid].append(z)
+            self._roi_cache_time = now
+        return self._roi_cache.get(cam_id, [])
+
+    async def _check_roi_zones(self, cam_id: str, detected_objs: list, frame: np.ndarray) -> None:
+        """Check if any detected objects fall inside active ROI zones."""
+        import time as _time
+        zones = await self._load_roi_zones(cam_id)
+        if not zones:
+            return
+
+        h, w = frame.shape[:2]
+        now = _time.time()
+
+        for zone in zones:
+            zone_id = str(zone["_id"])
+            trigger_classes = zone.get("trigger_classes", [])
+            zone_points = zone.get("points", [])
+            if len(zone_points) < 3:
+                continue
+
+            # Convert normalised points to pixel polygon
+            polygon = np.array(
+                [[int(p[0] * w), int(p[1] * h)] for p in zone_points],
+                dtype=np.int32,
+            )
+
+            # Per-zone cooldown (30s)
+            last_trigger = self._roi_cooldowns.get(zone_id, 0)
+            if now - last_trigger < 30:
+                continue
+
+            for obj in detected_objs:
+                obj_class = getattr(obj, "class_", None) or obj.dict().get("class", "")
+                # Check if the object's class matches the zone's trigger classes
+                raw_trigger = trigger_classes  # e.g. ["person", "car"]
+                mapped = self._map_class_to_event_type(obj_class)
+                if obj_class not in raw_trigger and mapped.value not in raw_trigger:
+                    continue
+
+                # Get object center from bbox
+                bbox = obj.bbox if hasattr(obj, 'bbox') else obj.dict().get("bbox", {})
+                if hasattr(bbox, 'x'):
+                    cx = bbox.x + bbox.w // 2
+                    cy = bbox.y + bbox.h // 2
+                else:
+                    cx = bbox.get("x", 0) + bbox.get("w", 0) // 2
+                    cy = bbox.get("y", 0) + bbox.get("h", 0) // 2
+
+                # Point-in-polygon test
+                result = cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False)
+                if result >= 0:
+                    # Object is inside the zone!
+                    self._roi_cooldowns[zone_id] = now
+                    zone_name = zone.get("name", "ROI Zone")
+                    logger.info(f"🎯 ROI triggered: '{zone_name}' — {obj_class} detected in zone on camera {cam_id}")
+
+                    # Send notification if enabled
+                    if zone.get("notify"):
+                        try:
+                            await notification_service.send(
+                                title=f"🎯 ROI Alert: {zone_name}",
+                                message=f"{obj_class} detected in '{zone_name}' zone",
+                                priority="high",
+                            )
+                        except Exception as e:
+                            logger.warning(f"ROI notification failed: {e}")
+                    break  # One trigger per zone per cycle
 
     def _map_class_to_event_type(self, yolo_class: str) -> EventType:
         """Map raw COCO class names to generic internal event types."""

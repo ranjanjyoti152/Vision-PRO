@@ -101,6 +101,7 @@ from app.routes.ai_models import router as ai_models_router
 from app.routes.ai_assistant import router as ai_assistant_router
 from app.routes.analytics import router as analytics_router
 from app.routes.heatmaps import router as heatmaps_router
+from app.routes.roi_zones import router as roi_zones_router
 
 app.include_router(auth_router)
 app.include_router(cameras_router)
@@ -113,6 +114,7 @@ app.include_router(ai_models_router)
 app.include_router(ai_assistant_router)
 app.include_router(analytics_router)
 app.include_router(heatmaps_router)
+app.include_router(roi_zones_router)
 
 # Static files for snapshots/recordings
 if os.path.exists(settings.RECORDING_PATH):

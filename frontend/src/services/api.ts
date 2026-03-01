@@ -152,3 +152,12 @@ export const heatmapApi = {
 
 // Legacy alias
 export const heatmapsApi = heatmapApi;
+
+// --- ROI Zones API ---
+export const roiApi = {
+    list: (cameraId?: string) => api.get('/roi-zones', { params: { camera_id: cameraId } }),
+    create: (data: any) => api.post('/roi-zones', data),
+    update: (id: string, data: any) => api.put(`/roi-zones/${id}`, data),
+    delete: (id: string) => api.delete(`/roi-zones/${id}`),
+    getClasses: () => api.get('/roi-zones/classes'),
+};

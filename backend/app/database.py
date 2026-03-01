@@ -90,3 +90,7 @@ def chat_history_collection():
 
 def heatmap_data_collection():
     return get_collection("heatmap_data")
+
+
+def roi_zones_collection():
+    return get_collection("roi_zones")
