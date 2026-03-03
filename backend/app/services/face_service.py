@@ -84,19 +84,20 @@ class FaceEngine:
         if not qdrant:
             return None, 0.0
             
-        # Qdrant with COSINE distance returns similarity score in [-1, 1] range.
-        # Higher score means more similar.
-        results = qdrant.search(
+        # qdrant-client v1.17+ uses query_points instead of search
+        results = qdrant.query_points(
             collection_name=FACES_COLLECTION,
-            query_vector=embedding.tolist(),
-            limit=1
+            query=embedding.tolist(),
+            limit=1,
         )
         
-        if not results:
+        # query_points returns a QueryResponse with .points list
+        points = results.points if hasattr(results, 'points') else []
+        if not points:
             return None, 0.0
             
         # The best match
-        best_match = results[0]
+        best_match = points[0]
         score = best_match.score
         
         if score >= threshold:

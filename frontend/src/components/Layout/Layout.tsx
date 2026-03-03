@@ -205,7 +205,7 @@ const Layout: React.FC = () => {
                 }}
             >
                 {/* Top bar */}
-                <AppBar position="sticky" sx={{ ml: { md: `${DRAWER_WIDTH}px` } }}>
+                <AppBar position="sticky">
                     <Toolbar>
                         <IconButton
                             edge="start"

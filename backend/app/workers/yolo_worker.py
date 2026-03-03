@@ -40,7 +40,7 @@ class YOLOEngine:
         self.model = None
 
     def load(self):
-        """Load the model into PyTorch/GPU."""
+        """Load the model into GPU (CUDA)."""
         logger.info(f"🧠 Loading YOLO model: {self.model_name}")
         model_path = str(settings.YOLO_MODELS_DIR / self.model_name)
         
@@ -50,15 +50,23 @@ class YOLOEngine:
             self.model = YOLO("yolov8n.pt")
         else:
             self.model = YOLO(model_path)
-            
-        logger.info(f"✅ YOLO model loaded onto {self.model.device}")
+        
+        # Force model onto GPU if CUDA is available
+        import torch
+        if torch.cuda.is_available():
+            self.model.to("cuda:0")
+            logger.info(f"✅ YOLO model loaded onto GPU (cuda:0)")
+        else:
+            logger.warning("⚠️ CUDA not available — YOLO running on CPU")
 
     def predict(self, frame: np.ndarray) -> list:
         """Run inference on a single BGR frame. Returns list of Results."""
         if self.model is None:
             return []
-        # Run inference (non-blocking in thread pool later)
-        return self.model.predict(frame, verbose=False)
+        # Run inference on GPU if available
+        import torch
+        device = 0 if torch.cuda.is_available() else "cpu"
+        return self.model.predict(frame, verbose=False, device=device)
 
 
 @dataclass
@@ -100,11 +108,27 @@ class DetectionWorker:
         """Start the worker loop."""
         if self._running:
             return
-            
+
+        # Load the active model from active_model.json (if it exists),
+        # otherwise fall back to the default yolov8n.pt
+        try:
+            import json
+            active_path = os.path.join(settings.MODELS_PATH, "active_model.json")
+            if os.path.exists(active_path):
+                with open(active_path) as f:
+                    info = json.load(f)
+                pt_path = info.get("pt_path", "")
+                if pt_path and os.path.exists(pt_path):
+                    self.engine = YOLOEngine(model_name=os.path.basename(pt_path))
+                    logger.info(f"📋 Using active model from config: {pt_path}")
+        except Exception as e:
+            logger.warning(f"Could not read active_model.json, using default: {e}")
+
         # Load model synchronously first so we don't block the loop later
         self.engine.load()
         from app.services.face_service import face_engine
         face_engine.load()
+
             
         self._running = True
         self._task = asyncio.create_task(self._run_loop(), name="yolo-worker")
@@ -120,6 +144,19 @@ class DetectionWorker:
             except asyncio.CancelledError:
                 pass
         logger.info("⏹ YOLO Detection Worker stopped")
+
+    async def reload_model(self, model_path: str):
+        """Hot-swap the YOLO model without restarting the worker."""
+        logger.info(f"🔄 Reloading YOLO model: {model_path}")
+        try:
+            new_engine = YOLOEngine(model_name=os.path.basename(model_path))
+            new_engine.load()
+            self.engine = new_engine
+            logger.info(f"✅ YOLO model reloaded: {model_path}")
+        except Exception as e:
+            logger.error(f"❌ Failed to reload YOLO model: {e}")
+            raise
+
 
     async def _run_loop(self):
         """Main detection polling loop."""
@@ -206,10 +243,12 @@ class DetectionWorker:
             
             # Filter logic: map YOLO classes to our target classes
             # (e.g., car/truck/bus -> vehicle, dog/cat/bird -> animal)
+            # Also accept raw class names for custom-trained models
             mapped_type = self._map_class_to_event_type(class_name)
             
-            if mapped_type.value not in target_classes:
+            if mapped_type.value not in target_classes and class_name not in target_classes:
                 continue
+
             if float(conf) < threshold:
                 continue
                 
@@ -230,13 +269,32 @@ class DetectionWorker:
         if not detected_objs:
             return
 
-        # ── ROI Zone Check ─────────────────────────────────────────
-        await self._check_roi_zones(cam_id, detected_objs, frame)
-            
-        # Cooldown passed -> Create Event
+        # ── Broadcast detections for live bounding-box overlay ─────
+        try:
+            from app.core.websocket import ws_manager
+            det_payload = {
+                "camera_id": cam_id,
+                "timestamp": time.time(),
+                "frame_w": frame.shape[1],
+                "frame_h": frame.shape[0],
+                "detections": [
+                    {
+                        "class": obj.class_name,
+                        "confidence": round(obj.confidence, 2),
+                        "bbox": obj.bbox.model_dump() if hasattr(obj.bbox, 'model_dump') else obj.bbox,
+                    }
+                    for obj in detected_objs
+                ],
+            }
+            await ws_manager.broadcast_to_channel(
+                f"detections:{cam_id}", det_payload
+            )
+        except Exception:
+            pass  # Non-critical: don't break detection pipeline
+
+        # ── Face Recognition (runs for ALL person detections) ──────
         face_id = None
-        
-        # If PERSON detected, run Face Recognition pipeline
+
         if highest_conf_class == EventType.PERSON and primary_bbox:
             pad_w = int(primary_bbox.w * 0.2)
             pad_h = int(primary_bbox.h * 0.2)
@@ -244,17 +302,17 @@ class DetectionWorker:
             y2 = min(frame.shape[0], primary_bbox.y + primary_bbox.h + pad_h)
             x1 = max(0, primary_bbox.x - pad_w)
             x2 = min(frame.shape[1], primary_bbox.x + primary_bbox.w + pad_w)
-            
+
             crop = frame[y1:y2, x1:x2]
-            
+
             if crop.size > 0:
                 from app.services.face_service import face_engine
                 from app.database import faces_collection
-                
+
                 embedding = await asyncio.to_thread(face_engine.extract_embedding, crop)
                 if embedding is not None:
                     matched_id, score = await asyncio.to_thread(face_engine.match_face, embedding, threshold=0.5)
-                    
+
                     if matched_id:
                         face_id = matched_id
                         highest_conf_class = EventType.FACE_KNOWN
@@ -286,7 +344,7 @@ class DetectionWorker:
                         }
                         insert_res = await faces_collection().insert_one(doc)
                         face_id = str(insert_res.inserted_id)
-                        
+
                         # Save face crop thumbnail
                         crop_path = self._save_face_crop(crop, face_id)
                         if crop_path:
@@ -294,7 +352,7 @@ class DetectionWorker:
                                 {"_id": insert_res.inserted_id},
                                 {"$set": {"thumbnail": crop_path}}
                             )
-                        
+
                         point_id = await asyncio.to_thread(face_engine.enroll_face, face_id, embedding)
                         if point_id:
                             await faces_collection().update_one(
@@ -302,8 +360,20 @@ class DetectionWorker:
                                 {"$push": {"embedding_ids": point_id}}
                             )
 
+        # ── ROI Zone Check (only gates event creation) ─────────────
+        roi_triggered = await self._check_roi_zones(cam_id, detected_objs, frame)
+        if not roi_triggered:
+            return
 
-        await self._create_event(cam_id, highest_conf_class, highest_conf, primary_bbox, detected_objs, frame, result, face_id)
+        if primary_bbox is None or highest_conf_class is None:
+            logger.warning(f"⚠️ ROI triggered on {cam_id} but primary_bbox or event_type is None — skipping event")
+            return
+
+        try:
+            await self._create_event(cam_id, highest_conf_class, highest_conf, primary_bbox, detected_objs, frame, result, face_id)
+        except Exception as e:
+            logger.error(f"❌ Failed to create event for camera {cam_id}: {e}", exc_info=True)
+
 
     def _save_face_crop(self, crop: np.ndarray, face_id: str) -> Optional[str]:
         """Save a face crop image to disk and return its web-accessible path."""
@@ -323,6 +393,7 @@ class DetectionWorker:
                 return f"/face_crops/{filename}"
         except Exception as e:
             logger.error(f"Failed to save face crop for {face_id}: {e}")
+
         return None
 
     async def _load_roi_zones(self, cam_id: str) -> list:
@@ -343,12 +414,14 @@ class DetectionWorker:
             self._roi_cache_time = now
         return self._roi_cache.get(cam_id, [])
 
-    async def _check_roi_zones(self, cam_id: str, detected_objs: list, frame: np.ndarray) -> None:
-        """Check if any detected objects fall inside active ROI zones."""
+    async def _check_roi_zones(self, cam_id: str, detected_objs: list, frame: np.ndarray) -> bool:
+        """Check if any detected objects fall inside active ROI zones.
+        Returns True if at least one object triggered a zone, False otherwise.
+        """
         import time as _time
         zones = await self._load_roi_zones(cam_id)
         if not zones:
-            return
+            return False
 
         h, w = frame.shape[:2]
         now = _time.time()
@@ -372,7 +445,9 @@ class DetectionWorker:
                 continue
 
             for obj in detected_objs:
-                obj_class = getattr(obj, "class_", None) or obj.dict().get("class", "")
+                # Get raw class name from DetectedObject
+                obj_class = obj.class_name
+
                 # Check if the object's class matches the zone's trigger classes
                 raw_trigger = trigger_classes  # e.g. ["person", "car"]
                 mapped = self._map_class_to_event_type(obj_class)
@@ -380,13 +455,14 @@ class DetectionWorker:
                     continue
 
                 # Get object center from bbox
-                bbox = obj.bbox if hasattr(obj, 'bbox') else obj.dict().get("bbox", {})
-                if hasattr(bbox, 'x'):
-                    cx = bbox.x + bbox.w // 2
-                    cy = bbox.y + bbox.h // 2
-                else:
+                bbox = obj.bbox
+                if isinstance(bbox, dict):
                     cx = bbox.get("x", 0) + bbox.get("w", 0) // 2
                     cy = bbox.get("y", 0) + bbox.get("h", 0) // 2
+                else:
+                    cx = bbox.x + bbox.w // 2
+                    cy = bbox.y + bbox.h // 2
+
 
                 # Point-in-polygon test
                 result = cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False)
@@ -406,7 +482,9 @@ class DetectionWorker:
                             )
                         except Exception as e:
                             logger.warning(f"ROI notification failed: {e}")
-                    break  # One trigger per zone per cycle
+                    return True  # At least one object triggered a zone
+
+        return False  # No object triggered any zone
 
     def _map_class_to_event_type(self, yolo_class: str) -> EventType:
         """Map raw COCO class names to generic internal event types."""
@@ -433,7 +511,12 @@ class DetectionWorker:
         event_uuid = str(uuid.uuid4())
         
         # 1. Plot boxes on frame and save snapshot
-        annotated_frame = result.plot()
+        try:
+            annotated_frame = result.plot()
+        except Exception as e:
+            logger.warning(f"result.plot() failed ({e}), using raw frame")
+            annotated_frame = raw_frame
+
         snapshot_filename = f"{cam_id}_{event_uuid}.jpg"
         snapshot_abs_path = settings.SNAPSHOT_DIR / snapshot_filename
         
@@ -485,10 +568,11 @@ class DetectionWorker:
             face_name=face_name,
         )
         
-        # 4. Dispatch Notifications (fire and forget)
+        # 5. Dispatch Notifications (fire and forget)
         asyncio.create_task(
             notification_service.dispatch(default_summary, str(snapshot_abs_path))
         )
+
 
     async def handle_deepstream_event(
         self,
@@ -591,28 +675,56 @@ class DetectionWorker:
             end_time = datetime.now(timezone.utc)
             actual_duration = len(frames) / fps
 
-            # Write video using VP8 codec in WebM container (browser-native)
+            # Write video — try H.264 first (browser-native), fall back to mp4v + ffmpeg
             result_info = [clip_filename, clip_path]  # mutable container for inner fn
 
             def write_clip():
+                import subprocess
+                import shutil
+
                 h, w = frames[0].shape[:2]
                 out_filename = result_info[0]
                 out_path = result_info[1]
-                # Use mp4v codec in MP4 container (universally supported)
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
-                if not writer.isOpened():
-                    # Fallback: XVID in AVI
+
+                # Try H.264 codec first (browser-compatible natively)
+                for codec in ['avc1', 'H264', 'mp4v']:
+                    fourcc = cv2.VideoWriter_fourcc(*codec)
+                    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
+                    if writer.isOpened():
+                        break
+                    writer.release()
+                else:
+                    # Last resort: XVID in AVI
                     out_filename = f"{cam_id}_{event_uuid}.avi"
                     out_path = settings.RECORDING_DIR / out_filename
                     fourcc = cv2.VideoWriter_fourcc(*'XVID')
                     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (w, h))
                     result_info[0] = out_filename
                     result_info[1] = out_path
+
                 for f in frames:
                     if f.shape[:2] == (h, w):
                         writer.write(f)
                 writer.release()
+
+                # If we used mp4v (not browser-compatible), re-encode with ffmpeg to H.264
+                if codec == 'mp4v' and shutil.which('ffmpeg'):
+                    h264_filename = out_filename.replace('.mp4', '_h264.mp4')
+                    h264_path = settings.RECORDING_DIR / h264_filename
+                    try:
+                        subprocess.run([
+                            'ffmpeg', '-y', '-i', str(out_path),
+                            '-c:v', 'libx264', '-preset', 'ultrafast',
+                            '-crf', '28', '-movflags', '+faststart',
+                            str(h264_path),
+                        ], capture_output=True, timeout=60)
+                        if h264_path.exists() and h264_path.stat().st_size > 0:
+                            os.remove(str(out_path))
+                            os.rename(str(h264_path), str(out_path))
+                            logger.info("🎬 Re-encoded clip to H.264 for browser playback")
+                    except Exception as e:
+                        logger.warning(f"ffmpeg re-encode failed (clip still playable via download): {e}")
+
 
             await asyncio.to_thread(write_clip)
 

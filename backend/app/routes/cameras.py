@@ -249,3 +249,25 @@ async def websocket_live_feed(websocket: WebSocket, camera_id: str):
         pass
     finally:
         await ws_manager.disconnect(websocket, channel)
+
+
+@router.websocket("/ws/{camera_id}/detections")
+async def websocket_detections(websocket: WebSocket, camera_id: str):
+    """
+    WebSocket endpoint for live YOLO detection data (JSON).
+    Broadcasts bounding boxes, class names, and confidence scores.
+    """
+    channel = f"detections:{camera_id}"
+    await ws_manager.connect(websocket, channel)
+    try:
+        while True:
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        await ws_manager.disconnect(websocket, channel)
+

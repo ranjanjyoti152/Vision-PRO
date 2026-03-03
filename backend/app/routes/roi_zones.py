@@ -67,15 +67,40 @@ def _doc_to_resp(doc: dict) -> dict:
 @router.get("/classes")
 async def get_yolo_classes(user: dict = Depends(get_current_user)):
     """Return available YOLO detection class names."""
-    # Try loading from the active model first
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    # Strategy 1: Read from the running detection worker's loaded model
     try:
         from app.workers.yolo_worker import detection_worker
         if detection_worker.engine.model is not None:
             names = list(detection_worker.engine.model.names.values())
             return {"classes": sorted(names)}
-    except Exception:
-        pass
+    except Exception as e:
+        _logger.warning(f"Could not read classes from detection worker: {e}")
+
+    # Strategy 2: Load the active model file and instantiate temporarily
+    try:
+        import json, os
+        from app.config import settings
+        active_path = os.path.join(settings.MODELS_PATH, "active_model.json")
+        if os.path.exists(active_path):
+            with open(active_path) as f:
+                info = json.load(f)
+            pt_path = info.get("pt_path", "")
+            if pt_path and os.path.exists(pt_path):
+                from ultralytics import YOLO
+                tmp_model = YOLO(pt_path)
+                names = list(tmp_model.names.values())
+                _logger.info(f"Loaded classes from active model file: {pt_path}")
+                return {"classes": sorted(names)}
+    except Exception as e:
+        _logger.warning(f"Could not read classes from active model file: {e}")
+
+    # Strategy 3: Fallback to standard COCO-80 class list
+    _logger.info("Falling back to default COCO-80 class list")
     return {"classes": COCO_CLASSES}
+
 
 
 @router.get("")

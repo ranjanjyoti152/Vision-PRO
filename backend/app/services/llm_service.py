@@ -15,6 +15,14 @@ logger = logging.getLogger(__name__)
 # Max pending summaries in queue — oldest are dropped when full
 _QUEUE_MAX = 20
 
+# System prompt for event summaries
+_SUMMARY_SYSTEM = (
+    "You are an expert security surveillance AI analyst. "
+    "You generate concise, professional, single-sentence event summaries "
+    "for a video management system. Be specific and actionable. "
+    "Never include quotes, preamble, or extra text — output ONLY the summary sentence."
+)
+
 
 class LLMService:
     def __init__(self):
@@ -48,9 +56,11 @@ class LLMService:
                     await events_collection().update_one(
                         {"_id": event_oid}, {"$set": {"ai_summary": ai_summary}}
                     )
-                    logger.debug(f"✅ Summary updated for event {event_oid}")
+                    logger.info(f"✅ AI summary saved for event {event_oid}: {ai_summary[:80]}")
+                else:
+                    logger.warning(f"⚠️ LLM returned empty/fallback summary for event {event_oid}")
             except Exception as e:
-                logger.debug(f"Summary queue job failed: {e}")
+                logger.warning(f"❌ Summary queue job failed for event {job.get('event_oid', '?')}: {e}")
             finally:
                 self._queue.task_done()
 
@@ -65,9 +75,9 @@ class LLMService:
                 "objects": objects,
                 "face_name": face_name,
             })
-            logger.debug(f"📝 Queued summary (pending: {self._queue.qsize()})")
+            logger.info(f"📝 Queued summary for {event_type} event (pending: {self._queue.qsize()})")
         except asyncio.QueueFull:
-            logger.debug("📝 Summary queue full, skipping")
+            logger.warning("📝 Summary queue full — dropping oldest request")
 
     async def _get_llm_settings(self) -> Dict[str, Any]:
         """Fetch all LLM settings from the database and decrypt keys."""
@@ -87,40 +97,40 @@ class LLMService:
 
     async def generate_event_summary(self, event_type: EventType, confidence: float, objects: List[Dict], face_name: Optional[str] = None) -> str:
         """Generate a concise 1-sentence summary of an event."""
-        
-        # Build a prompt describing the event
-        objects_str = ", ".join([f"{obj.get('class', 'unknown')} ({obj.get('confidence', 0):.2f})" for obj in objects])
+
+        # Build a descriptive context
+        objects_str = ", ".join([
+            f"{obj.get('class', 'unknown')} ({obj.get('confidence', 0):.0%})"
+            for obj in objects
+        ])
         if not objects_str:
             objects_str = "no specific objects"
-            
+
         prompt = (
-            f"You are a security AI. Write a concise, single-sentence summary of the following security event.\n"
-            f"Event Type: {event_type.value}\n"
-            f"Confidence: {confidence:.2f}\n"
-            f"Objects Detected: {objects_str}\n"
+            f"Summarize this security camera event in one professional sentence:\n"
+            f"• Event type: {event_type.value}\n"
+            f"• Detection confidence: {confidence:.0%}\n"
+            f"• Objects detected: {objects_str}\n"
         )
         if face_name:
-            prompt += f"Known Face Identified: {face_name}\n"
-            
-        prompt += "\nOutput ONLY the summary sentence, without quotes or extra text."
+            prompt += f"• Known individual identified: {face_name}\n"
+
+        prompt += "\nProvide ONLY the summary sentence."
 
         return await self._generate_text(prompt, fallback="Event detected.")
 
     async def chat(self, messages: List[Dict[str, str]]) -> str:
         """Handle a chat conversation with the AI Assistant."""
-        # Assume messages is a list of {"role": "user/assistant", "content": "..."}
         if not messages:
             return "How can I help you?"
-            
-        # Extract the last user message to use as a prompt for simpler LLMs if needed,
-        # but modern APIs support full message history.
+
         try:
             settings = await self._get_llm_settings()
             provider = settings.get("active_provider")
-            
+
             if not provider:
                 return "AI Assistant is not configured. Please set up an LLM provider in Settings."
-                
+
             return await self._call_provider(provider, settings, messages)
         except Exception as e:
             logger.error(f"Chat error: {e}")
@@ -132,27 +142,32 @@ class LLMService:
         try:
             settings = await self._get_llm_settings()
             provider = settings.get("active_provider")
-            
+
             if not provider:
+                logger.warning("⚠️ No LLM provider configured — using fallback summary")
                 return fallback
 
             model_key = f"{provider}_default_model"
             model = settings.get(model_key, "unknown")
-            logger.debug(f"Calling {provider}/{model} for event summary")
-                
-            messages = [{"role": "user", "content": prompt}]
+            logger.info(f"🤖 Calling {provider}/{model} for event summary")
+
+            # Use system + user message for higher quality output
+            messages = [
+                {"role": "system", "content": _SUMMARY_SYSTEM},
+                {"role": "user", "content": prompt},
+            ]
             result = await self._call_provider(provider, settings, messages)
             return result.strip() if result else fallback
-            
+
         except httpx.TimeoutException:
-            logger.warning(f"LLM request timed out ({provider})")
+            logger.warning(f"⏱️ LLM request timed out ({provider})")
             return fallback
         except httpx.HTTPStatusError as e:
-            logger.error(f"LLM HTTP error ({provider}): {e.response.status_code} - {e.response.text[:200]}")
+            logger.error(f"❌ LLM HTTP error ({provider}): {e.response.status_code} - {e.response.text[:200]}")
             return fallback
         except Exception as e:
             err_msg = str(e) or type(e).__name__
-            logger.error(f"Failed to generate LLM text ({provider}): {err_msg}")
+            logger.error(f"❌ Failed to generate LLM summary ({provider}): {err_msg}")
             return fallback
 
     async def _call_provider(self, provider: str, settings: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
@@ -171,7 +186,7 @@ class LLMService:
     async def _call_ollama(self, settings: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
         base_url = settings.get("ollama_base_url", "http://localhost:11434").rstrip("/")
         model = settings.get("ollama_default_model", "llama3")
-        
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
                 f"{base_url}/api/chat",
@@ -189,12 +204,12 @@ class LLMService:
         base_url = settings.get("openai_base_url", "https://api.openai.com/v1").rstrip("/")
         api_key = settings.get("openai_api_key", "")
         model = settings.get("openai_default_model", "gpt-4o")
-        
+
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
                 f"{base_url}/chat/completions",
@@ -209,18 +224,25 @@ class LLMService:
             return data["choices"][0]["message"]["content"]
 
     async def _call_gemini(self, settings: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
-        # Gemini uses a different API format (Google AI Studio)
         api_key = settings.get("gemini_api_key", "")
         model = settings.get("gemini_default_model", "gemini-2.0-flash")
-        
+
         # Convert standard messages to Gemini format
+        # Gemini doesn't support "system" role — prepend it to the first user message
         contents = []
+        system_text = ""
         for msg in messages:
+            if msg["role"] == "system":
+                system_text = msg["content"] + "\n\n"
+                continue
             role = "user" if msg["role"] == "user" else "model"
-            contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-            
+            text = (system_text + msg["content"]) if system_text and role == "user" else msg["content"]
+            contents.append({"role": role, "parts": [{"text": text}]})
+            if system_text and role == "user":
+                system_text = ""  # Only prepend once
+
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
                 url,
@@ -231,19 +253,20 @@ class LLMService:
             try:
                 return data["candidates"][0]["content"]["parts"][0]["text"]
             except (KeyError, IndexError):
+                logger.warning(f"Gemini returned unexpected response: {str(data)[:200]}")
                 return ""
 
     async def _call_openrouter(self, settings: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
         api_key = settings.get("openrouter_api_key", "")
         model = settings.get("openrouter_default_model", "")
-        
+
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "HTTP-Referer": "http://localhost:5173", # standard requirement for openrouter
+            "HTTP-Referer": "http://localhost:5173",
             "X-Title": "Vision Pro NVR",
             "Content-Type": "application/json"
         }
-        
+
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             resp = await client.post(
                 "https://openrouter.ai/api/v1/chat/completions",
@@ -259,3 +282,4 @@ class LLMService:
 
 
 llm_service = LLMService()
+

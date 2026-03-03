@@ -112,7 +112,10 @@ async def stream_recording(
     recording_id: str,
     request: Request,
 ):
-    """Stream a recording file. No auth required for video element access."""
+    """Stream a recording file with HTTP Range support for <video> element."""
+    from fastapi.responses import StreamingResponse
+    import stat
+
     rec = await recordings_collection().find_one({"_id": ObjectId(recording_id)})
     if not rec:
         raise HTTPException(status_code=404, detail="Recording not found")
@@ -126,11 +129,59 @@ async def stream_recording(
     media_types = {'.webm': 'video/webm', '.mp4': 'video/mp4', '.avi': 'video/x-msvideo'}
     media_type = media_types.get(ext, 'video/mp4')
 
-    return FileResponse(
-        filepath,
+    file_size = os.path.getsize(filepath)
+    range_header = request.headers.get("range")
+
+    if range_header:
+        # Parse Range: bytes=START-END
+        range_spec = range_header.replace("bytes=", "").strip()
+        parts = range_spec.split("-")
+        start = int(parts[0]) if parts[0] else 0
+        end = int(parts[1]) if parts[1] else file_size - 1
+        end = min(end, file_size - 1)
+        content_length = end - start + 1
+
+        def iter_range():
+            with open(filepath, "rb") as f:
+                f.seek(start)
+                remaining = content_length
+                chunk_size = 64 * 1024  # 64 KB chunks
+                while remaining > 0:
+                    read_size = min(chunk_size, remaining)
+                    data = f.read(read_size)
+                    if not data:
+                        break
+                    remaining -= len(data)
+                    yield data
+
+        return StreamingResponse(
+            iter_range(),
+            status_code=206,
+            media_type=media_type,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(content_length),
+                "Content-Disposition": f'inline; filename="{os.path.basename(filepath)}"',
+            },
+        )
+
+    # No Range header — serve the whole file
+    def iter_file():
+        with open(filepath, "rb") as f:
+            while chunk := f.read(64 * 1024):
+                yield chunk
+
+    return StreamingResponse(
+        iter_file(),
         media_type=media_type,
-        filename=os.path.basename(filepath),
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(file_size),
+            "Content-Disposition": f'inline; filename="{os.path.basename(filepath)}"',
+        },
     )
+
 
 
 @router.post("/export")
