@@ -598,15 +598,16 @@ class DetectionWorker:
         # ── ROI Zone Check ────────────────────────────────────────────
         # Load the ROI zones for this camera (cached, refreshes every 30s)
         zones = await self._load_roi_zones(camera_id)
-        if zones:
-            # Filter detections to only those inside an ROI zone
-            roi_detections = self._filter_detections_by_roi(
-                detections, zones, frame_width, frame_height
-            )
-            if not roi_detections:
-                return  # No detections inside any ROI — skip event
-            detections = roi_detections
-        # If NO zones defined for this camera, allow all detections through
+        if not zones:
+            return  # No ROI zones defined — no events without ROI
+
+        # Filter detections to only those inside an ROI zone
+        roi_detections = self._filter_detections_by_roi(
+            detections, zones, frame_width, frame_height
+        )
+        if not roi_detections:
+            return  # No detections inside any ROI — skip event
+        detections = roi_detections
 
         tracker = self.cooldowns.get(camera_id)
         if not tracker:
