@@ -1,6 +1,8 @@
 """
 TensorRT model conversion — runs inside the DeepStream container at startup.
-Converts yolov8n.pt → yolov8n.engine (FP16, imgsz=640).
+
+On x86 dGPU:  yolov8n.pt → yolov8n.engine (direct, via ultralytics)
+On Jetson:    yolov8n.pt → yolov8n.onnx → yolov8n.engine (via onnx_convert)
 """
 import os
 import shutil
@@ -12,12 +14,37 @@ MODEL_PT   = os.environ.get("YOLO_PT_PATH", "/models/yolo/yolov8n.pt")
 ENGINE_OUT = os.environ.get("TRT_ENGINE_PATH", "/models/yolo/yolov8n.engine")
 
 
+def _is_jetson() -> bool:
+    """Detect if running on an NVIDIA Jetson platform."""
+    if os.environ.get("JETSON_MODE", "").lower() in ("true", "1", "yes"):
+        return True
+    return os.path.exists("/etc/nv_tegra_release")
+
+
 def convert_if_needed() -> str:
-    """Convert .pt → .engine if the engine file doesn't exist yet."""
+    """Convert .pt → .engine if the engine file doesn't exist yet.
+
+    Automatically routes through ONNX on Jetson platforms.
+    """
     if os.path.exists(ENGINE_OUT):
         logger.info(f"✅ TensorRT engine already exists: {ENGINE_OUT}")
         return ENGINE_OUT
 
+    # ── Jetson path: PT → ONNX → Engine ─────────────────────────────────
+    if _is_jetson():
+        logger.info("🔧 Jetson platform detected — using ONNX conversion pipeline")
+        from app.deepstream.onnx_convert import convert_if_needed_jetson
+        onnx_path = os.environ.get(
+            "ONNX_MODEL_PATH",
+            MODEL_PT.replace(".pt", ".onnx").replace("/yolo/", "/onnx/"),
+        )
+        return convert_if_needed_jetson(
+            pt_path=MODEL_PT,
+            onnx_path=onnx_path,
+            engine_path=ENGINE_OUT,
+        )
+
+    # ── x86 dGPU path: PT → Engine (direct) ─────────────────────────────
     if not os.path.exists(MODEL_PT):
         logger.info(f"📥 Downloading yolov8n.pt ...")
         from ultralytics import YOLO
@@ -50,3 +77,4 @@ def convert_if_needed() -> str:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     convert_if_needed()
+

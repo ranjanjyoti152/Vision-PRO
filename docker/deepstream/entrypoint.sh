@@ -1,4 +1,8 @@
 #!/bin/bash
+# ============================================================================
+# Vision Pro DeepStream Entrypoint — x86 dGPU version
+# For Jetson (ARM64), see: docker/jetson/entrypoint_jetson.sh
+# ============================================================================
 set -e
 
 echo "🚀 Vision Pro DeepStream Pipeline Starting..."

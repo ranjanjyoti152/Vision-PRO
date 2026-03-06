@@ -1,0 +1,43 @@
+# ============================================================================
+# Vision Pro NVR – Backend Dockerfile (Jetson / ARM64)
+# ============================================================================
+# FastAPI backend with GPU-accelerated AI inference
+# ============================================================================
+
+FROM python:3.11-slim
+
+LABEL maintainer="Vision Pro NVR"
+LABEL description="FastAPI backend for Vision Pro NVR – Jetson ARM64"
+
+# ── System deps ──────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        libglib2.0-0 \
+        libgl1 \
+        libsm6 \
+        libxext6 \
+        libxrender-dev \
+        wget \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ── Python dependencies ─────────────────────────────────────────────────────
+COPY backend/requirements.jetson.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ── Copy application code ───────────────────────────────────────────────────
+COPY backend/ /app/
+
+# ── Runtime directories ─────────────────────────────────────────────────────
+RUN mkdir -p /app/recordings /app/snapshots /app/models/yolo /app/models/faces /app/models/onnx /app/face_crops
+
+# ── Environment defaults ────────────────────────────────────────────────────
+ENV PYTHONUNBUFFERED=1
+ENV BACKEND_HOST=0.0.0.0
+ENV BACKEND_PORT=8000
+
+EXPOSE 8000
+
+CMD ["python", "run.py"]

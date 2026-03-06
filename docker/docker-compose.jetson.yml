@@ -1,0 +1,156 @@
+# ============================================================================
+# Vision Pro NVR – Docker Compose for NVIDIA Jetson (JetPack 6.0 / L4T R36.x)
+# ============================================================================
+#
+# Usage:
+#   cd docker
+#   docker compose -f docker-compose.jetson.yml up -d
+#
+# First run will:
+#   1. Pull ARM64-compatible images (MongoDB, Qdrant)
+#   2. Build the DeepStream container for Jetson
+#   3. Convert YOLO model: .pt → .onnx → .engine (TensorRT FP16)
+#      This takes ~5-15 minutes on Jetson Orin, ~20-30 min on Jetson Nano
+#
+# ============================================================================
+
+services:
+  # ── MongoDB (ARM64 compatible) ─────────────────────────────────────────────
+  mongodb:
+    image: mongo:7.0
+    container_name: visionpro-mongodb-jetson
+    restart: unless-stopped
+    ports:
+      - "${MONGO_PORT:-27917}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-visionpro}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASS:-visionpro_secret}
+      MONGO_INITDB_DATABASE: visionpro
+    volumes:
+      - mongo_data_jetson:/data/db
+      - ./mongo-init.js:/docker-entrypoint-initdb.d/init.js:ro
+    networks:
+      - visionpro-net-jetson
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Qdrant Vector DB (ARM64 supported) ─────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: visionpro-qdrant-jetson
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_PORT:-6933}:6333"
+      - "${QDRANT_GRPC_PORT:-6934}:6334"
+    volumes:
+      - qdrant_data_jetson:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    networks:
+      - visionpro-net-jetson
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ── DeepStream Pipeline (Jetson GPU) ───────────────────────────────────────
+  deepstream:
+    build:
+      context: ..
+      dockerfile: docker/jetson/Dockerfile.jetson
+    image: visionpro-deepstream-jetson:latest
+    container_name: visionpro-deepstream-jetson
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=video,compute,utility
+      - JETSON_MODE=true
+      - MONGO_URI=mongodb://${MONGO_USER:-visionpro}:${MONGO_PASS:-visionpro_secret}@mongodb:27017/visionpro?authSource=admin
+      - YOLO_PT_PATH=/models/yolo/yolov8n.pt
+      - ONNX_MODEL_PATH=/models/onnx/yolov8n.onnx
+      - TRT_ENGINE_PATH=/models/yolo/yolov8n.engine
+      - TRT_WORKSPACE_GB=${TRT_WORKSPACE_GB:-2}
+      - DS_ZMQ_ENDPOINT=tcp://*:5570
+      - CONF_THRESHOLD=${DS_CONF_THRESHOLD:-0.45}
+      - TARGET_FPS=${STREAM_MAX_FPS:-15}
+    volumes:
+      - ../backend:/app
+      - ../backend/models:/models
+    ports:
+      - "${DEEPSTREAM_ZMQ_PORT:-5571}:5570"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks:
+      - visionpro-net-jetson
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu, video]
+
+  # ── FastAPI Backend ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/jetson/Dockerfile.backend
+    image: visionpro-backend-jetson:latest
+    container_name: visionpro-backend-jetson
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BACKEND_HOST=0.0.0.0
+      - BACKEND_PORT=8000
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+      - MONGO_USER=${MONGO_USER:-visionpro}
+      - MONGO_PASS=${MONGO_PASS:-visionpro_secret}
+      - MONGO_DB=visionpro
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - QDRANT_GRPC_PORT=6334
+      - SECRET_KEY=${SECRET_KEY:-change-this-to-a-random-secret-key}
+      - DEEPSTREAM_ENABLED=true
+      - DEEPSTREAM_HOST=deepstream
+      - DEEPSTREAM_ZMQ_PORT=5570
+      - JETSON_MODE=true
+      - MODELS_PATH=/app/models
+      - RECORDING_PATH=/app/recordings
+      - DEEPSTREAM_CONTAINER_NAME=visionpro-deepstream-jetson
+    volumes:
+      - ../backend:/app
+      - ../backend/models:/app/models
+      - ../backend/recordings:/app/recordings
+      - ../backend/snapshots:/app/snapshots
+      - ../backend/face_crops:/app/face_crops
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks:
+      - visionpro-net-jetson
+
+volumes:
+  mongo_data_jetson:
+    driver: local
+  qdrant_data_jetson:
+    driver: local
+
+networks:
+  visionpro-net-jetson:
+    driver: bridge

@@ -16,6 +16,9 @@
   <img src="https://img.shields.io/badge/mongodb-7-47A248?style=flat-square&logo=mongodb&logoColor=white" />
   <img src="https://img.shields.io/badge/qdrant-vector%20db-DC382D?style=flat-square&logo=data:image/svg+xml;base64,&logoColor=white" />
   <img src="https://img.shields.io/badge/CUDA-GPU%20accelerated-76B900?style=flat-square&logo=nvidia&logoColor=white" />
+  <img src="https://img.shields.io/badge/Jetson-Orin%20NX-76B900?style=flat-square&logo=nvidia&logoColor=white" />
+  <img src="https://img.shields.io/badge/DeepStream-7.1-76B900?style=flat-square&logo=nvidia&logoColor=white" />
+  <img src="https://img.shields.io/badge/JetPack-6.0-76B900?style=flat-square&logo=nvidia&logoColor=white" />
 </p>
 
 ---
@@ -27,6 +30,7 @@
 - [Tech Stack](#-tech-stack)
 - [Project Structure](#-project-structure)
 - [Getting Started](#-getting-started)
+- [Jetson Deployment](#-jetson-deployment-nvidia-orin-nx)
 - [API Reference](#-api-reference)
 - [Development Progress](#-development-progress)
 - [Roadmap](#-roadmap)
@@ -184,11 +188,18 @@ Vision-Pro/
 │       ├── App.tsx                  # Router + auth guards
 │       └── main.tsx                 # Entry point
 ├── docker/
-│   ├── docker-compose.yml           # MongoDB + Qdrant + DeepStream (optional profile)
-│   ├── deepstream/                  # NVIDIA DeepStream GPU pipeline
-│   │   ├── Dockerfile               # DeepStream 7.1 image
+│   ├── docker-compose.yml           # MongoDB + Qdrant + DeepStream (x86/desktop)
+│   ├── docker-compose.jetson.yml    # Full Jetson stack (all 4 services)
+│   ├── deepstream/                  # x86 DeepStream GPU pipeline
+│   │   ├── Dockerfile               # DeepStream 7.1 image (x86)
 │   │   ├── entrypoint.sh            # Auto TRT conversion + pipeline start
 │   │   └── convert_model.sh         # Manual model conversion helper
+│   ├── jetson/                      # NVIDIA Jetson deployment
+│   │   ├── Dockerfile.jetson        # DeepStream + pyds (aarch64)
+│   │   ├── Dockerfile.backend       # FastAPI backend (aarch64)
+│   │   ├── entrypoint_jetson.sh     # PT→ONNX→TRT + pipeline launch
+│   │   ├── convert_to_onnx.sh       # Manual ONNX/TRT helper
+│   │   └── install_docker_jetson.sh # Docker CE + NVIDIA runtime installer
 │   └── mongo-init.js                # DB initialization
 ├── .env.example                     # Environment template
 └── .gitignore
@@ -257,6 +268,129 @@ npm run dev
 ```
 
 Open **http://localhost:5173** — the first user to sign up becomes **admin** automatically.
+
+---
+
+## 🚀 Jetson Deployment (NVIDIA Orin NX)
+
+Vision Pro includes full Docker support for **NVIDIA Jetson** devices running JetPack 6.0 (L4T R36.x). The Jetson deployment uses ONNX as the model interchange format with on-device TensorRT engine building for maximum inference performance.
+
+### Architecture (Jetson)
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│              Docker Compose (Jetson Stack)                     │
+│                                                               │
+│  ┌─────────────────────┐    ┌─────────────────────────────┐  │
+│  │  Backend Container  │    │  DeepStream Container       │  │
+│  │  (python:3.11-slim) │    │  (DS 7.1 triton-multiarch)  │  │
+│  │                     │    │                             │  │
+│  │  FastAPI + Uvicorn  │    │  .pt → .onnx → .engine      │  │
+│  │  Motor (MongoDB)    │◄──►│  nvinfer + TensorRT (FP16)  │  │
+│  │  YOLO (CPU fallback)│ ZMQ│  nvtracker + pyds           │  │
+│  │  Face Recognition   │    │  GStreamer RTSP pipeline     │  │
+│  └─────────┬───────────┘    └─────────────────────────────┘  │
+│            │                                                  │
+│  ┌─────────▼───────────┐    ┌─────────────────────────────┐  │
+│  │  MongoDB 7 (arm64)  │    │  Qdrant (arm64)             │  │
+│  │  Document storage   │    │  Vector embeddings          │  │
+│  └─────────────────────┘    └─────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Model Conversion Pipeline
+
+```
+ .pt (PyTorch)  ──►  .onnx (ONNX)  ──►  .engine (TensorRT FP16)
+   Ultralytics       Portable format     Device-optimized
+   export()          Cross-platform      Built on-device
+```
+
+> **Note:** TensorRT engines are device-specific. The `.engine` file must be built on the target Jetson hardware. First-run conversion takes 5–15 minutes.
+
+### Prerequisites (Jetson)
+
+- **NVIDIA Jetson Orin NX** (or other Orin/Xavier device)
+- **JetPack 6.0** (L4T R36.x)
+- **Docker CE 27.x** + NVIDIA Container Toolkit
+
+### 1. Install Docker on Jetson
+
+Use the provided installer script (handles Docker CE 27.5.1, Compose, and NVIDIA runtime):
+
+```bash
+chmod +x docker/jetson/install_docker_jetson.sh
+sudo docker/jetson/install_docker_jetson.sh
+```
+
+This script:
+- Installs Docker CE 27.5.1 (compatible with Jetson tegra kernel)
+- Installs Docker Compose plugin
+- Installs NVIDIA Container Toolkit
+- Sets NVIDIA as the default Docker runtime
+- Disables direct access filtering (required for tegra kernel)
+
+### 2. Configure Environment
+
+```bash
+cp .env.example .env
+# Edit .env — key Jetson settings:
+#   JETSON_MODE=true
+#   TRT_WORKSPACE_GB=2
+#   DEEPSTREAM_ENABLED=true
+```
+
+### 3. Build & Run
+
+```bash
+cd docker
+docker compose -f docker-compose.jetson.yml build
+docker compose -f docker-compose.jetson.yml up
+```
+
+This starts **4 containers**:
+
+| Container | Image | Purpose |
+|-----------|-------|---------|
+| `visionpro-deepstream-jetson` | DS 7.1 triton-multiarch | GPU inference pipeline |
+| `visionpro-backend-jetson` | python:3.11-slim | FastAPI REST API |
+| `visionpro-mongodb-jetson` | mongo:7.0 (arm64) | Document database |
+| `visionpro-qdrant-jetson` | qdrant/qdrant (arm64) | Vector database |
+
+### 4. Start Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open **http://<jetson-ip>:5173** — the first user to sign up becomes **admin**.
+
+### Key Differences: Jetson vs Desktop
+
+| Feature | Desktop (x86) | Jetson (aarch64) |
+|---------|---------------|------------------|
+| Base image | `nvcr.io/nvidia/deepstream:7.1-gc-triton-devel` | `nvcr.io/nvidia/deepstream:7.1-triton-multiarch` |
+| Python | 3.12 | 3.10 (DeepStream) / 3.11 (Backend) |
+| Model format | .pt → .engine (direct) | .pt → .onnx → .engine (two-stage) |
+| TRT workspace | 4 GB | 2 GB (limited VRAM) |
+| onnxruntime | GPU (`onnxruntime-gpu`) | CPU (`onnxruntime`) |
+| Docker runtime | `nvidia` | `nvidia` (tegra) |
+| pyds install | Pre-installed | Manual wheel (`cp310-cp310`) |
+
+### Jetson-Specific Files
+
+| File | Purpose |
+|------|---------|
+| `docker/jetson/Dockerfile.jetson` | DeepStream container with pyds, ONNX, TRT |
+| `docker/jetson/Dockerfile.backend` | Backend container optimized for aarch64 |
+| `docker/jetson/entrypoint_jetson.sh` | Model conversion + pipeline startup |
+| `docker/jetson/convert_to_onnx.sh` | Manual ONNX/TRT conversion helper |
+| `docker/jetson/install_docker_jetson.sh` | Docker CE + NVIDIA runtime installer |
+| `docker/docker-compose.jetson.yml` | Full 4-service Jetson stack |
+| `backend/requirements.jetson.txt` | Python deps (CPU onnxruntime) |
+| `backend/app/deepstream/onnx_convert.py` | PT→ONNX→TRT conversion module |
 
 ---
 

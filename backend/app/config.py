@@ -65,6 +65,19 @@ class Settings(BaseSettings):
     TRT_ENGINE_PATH: str = str(BASE_DIR / "models" / "yolo" / "yolov8n.engine")
     DS_CONF_THRESHOLD: float = 0.45
 
+    # --- Jetson Configuration ---
+    JETSON_MODE: bool = False                # True when running on Jetson (set via env or auto-detected)
+    ONNX_MODEL_PATH: str = ""                # Path to ONNX model (auto-derived from PT path if empty)
+    TRT_WORKSPACE_GB: int = 2                # TRT builder workspace (2GB for Jetson, 4GB for dGPU)
+
+    @property
+    def IS_JETSON(self) -> bool:
+        """Detect Jetson platform via env var or tegra release file."""
+        if self.JETSON_MODE:
+            return True
+        import os
+        return os.path.exists("/etc/nv_tegra_release")
+
     @property
     def RECORDING_DIR(self) -> Path:
         path = Path(self.RECORDING_PATH)

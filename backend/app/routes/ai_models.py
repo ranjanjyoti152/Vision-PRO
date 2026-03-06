@@ -40,10 +40,17 @@ def _model_doc_to_response(doc: dict) -> AIModelResponse:
 
 
 def _write_active_model(pt_path: str, model_name: str) -> None:
-    """Persist the active model selection to a shared JSON file."""
+    """Persist the active model selection to a shared JSON file.
+
+    Includes the ONNX path so the Jetson entrypoint knows where to find/create it.
+    """
     os.makedirs(settings.MODELS_PATH, exist_ok=True)
+    onnx_dir = os.path.join(settings.MODELS_PATH, "onnx")
+    os.makedirs(onnx_dir, exist_ok=True)
+    basename = os.path.splitext(os.path.basename(pt_path))[0]
     data = {
         "pt_path": pt_path,
+        "onnx_path": os.path.join(onnx_dir, f"{basename}.onnx"),
         "engine_path": pt_path.replace(".pt", ".engine"),
         "model_name": model_name,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -73,8 +80,10 @@ async def get_active_model(user: dict = Depends(get_current_user)):
         with open(ACTIVE_MODEL_FILE) as f:
             return json.load(f)
     # Default fallback
+    onnx_dir = os.path.join(settings.MODELS_PATH, "onnx")
     return {
         "pt_path": str(settings.YOLO_MODELS_DIR / "yolov8n.pt"),
+        "onnx_path": os.path.join(onnx_dir, "yolov8n.onnx"),
         "engine_path": str(settings.YOLO_MODELS_DIR / "yolov8n.engine"),
         "model_name": "yolov8n",
         "updated_at": None,
@@ -140,6 +149,20 @@ async def set_default_model(
     pt_path = model.get("file_path", str(settings.YOLO_MODELS_DIR / f"{model['name']}.pt"))
     _write_active_model(pt_path, model["name"])
 
+    # On Jetson: trigger ONNX conversion in the background so it's ready
+    # before the user restarts the DeepStream container
+    onnx_converted = False
+    if settings.IS_JETSON:
+        try:
+            from app.deepstream.onnx_convert import convert_pt_to_onnx
+            onnx_dir = os.path.join(settings.MODELS_PATH, "onnx")
+            basename = os.path.splitext(os.path.basename(pt_path))[0]
+            onnx_path = os.path.join(onnx_dir, f"{basename}.onnx")
+            convert_pt_to_onnx(pt_path, onnx_path)
+            onnx_converted = True
+        except Exception as e:
+            pass  # ONNX conversion will happen at DeepStream startup too
+
     # Also hot-reload the standard YOLO worker if not using DeepStream
     if not settings.DEEPSTREAM_ENABLED:
         try:
@@ -151,6 +174,8 @@ async def set_default_model(
     return {
         "message": f"{model['name']} set as default",
         "deepstream_restart_required": settings.DEEPSTREAM_ENABLED,
+        "jetson_mode": settings.IS_JETSON,
+        "onnx_pre_converted": onnx_converted,
         "active_model_file": ACTIVE_MODEL_FILE,
     }
 
@@ -167,7 +192,12 @@ async def reload_deepstream(admin: dict = Depends(require_admin)):
     try:
         import docker  # pip install docker
         client = docker.from_env()
-        container = client.containers.get("visionpro-deepstream")
+        # Container name is configurable; default includes Jetson suffix when in Jetson mode
+        container_name = os.environ.get(
+            "DEEPSTREAM_CONTAINER_NAME",
+            "visionpro-deepstream-jetson" if settings.IS_JETSON else "visionpro-deepstream"
+        )
+        container = client.containers.get(container_name)
         container.restart(timeout=5)
         return {
             "message": "DeepStream container restarting — new model will be loaded",
@@ -175,11 +205,15 @@ async def reload_deepstream(admin: dict = Depends(require_admin)):
             "status": "restarting",
         }
     except Exception as e:
+        container_name = os.environ.get(
+            "DEEPSTREAM_CONTAINER_NAME",
+            "visionpro-deepstream-jetson" if settings.IS_JETSON else "visionpro-deepstream"
+        )
         raise HTTPException(
             status_code=503,
             detail=(
                 f"Could not restart DeepStream container: {e}. "
-                "Run manually: docker restart visionpro-deepstream"
+                f"Run manually: docker restart {container_name}"
             ),
         )
 

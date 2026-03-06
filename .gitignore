@@ -21,7 +21,10 @@ frontend/dist/
 # AI Models (large files)
 models/yolo/*.pt
 models/yolo/*.onnx
+models/yolo/*.engine
 models/faces/*.onnx
+*.engine
+*.onnx
 
 # Recordings — ignore contents, keep directory
 backend/recordings/*

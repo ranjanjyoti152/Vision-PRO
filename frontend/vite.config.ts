@@ -8,7 +8,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8090',
+        target: 'http://localhost:8000',
         changeOrigin: true,
         ws: true,  // Enable WebSocket proxying for /api/cameras/ws/... paths
         configure: (proxy) => {
@@ -20,23 +20,23 @@ export default defineConfig({
         },
       },
       '/ws': {
-        target: 'ws://localhost:8090',
+        target: 'ws://localhost:8000',
         ws: true,
       },
       '/recordings': {
-        target: 'http://localhost:8090',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
       '/snapshots': {
-        target: 'http://localhost:8090',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
       '/face_references': {
-        target: 'http://localhost:8090',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
       '/face_crops': {
-        target: 'http://localhost:8090',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
     },

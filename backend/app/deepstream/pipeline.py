@@ -30,6 +30,7 @@ import msgpack
 
 from app.deepstream.bridge import DeepStreamBridge, COCO_CLASSES, EVENT_CLASS_MAP
 from app.deepstream.trt_convert import convert_if_needed
+from urllib.parse import urlparse, quote, urlunparse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
 logger = logging.getLogger("deepstream.pipeline")
@@ -53,17 +54,16 @@ NVINFER_CONFIG_TMPL = """
 gpu-id=0
 net-scale-factor=0.0039215697906911373
 model-engine-file={engine_path}
-labelfile-path=/tmp/labels.txt
+{onnx_file_line}labelfile-path=/tmp/labels.txt
 batch-size=1
 network-type=0
 num-detected-classes=80
 interval=0
 gie-unique-id=1
-output-bbox-layer-name=output0
 force-implicit-batch-dim=1
 
 [class-attrs-all]
-threshold={threshold}
+pre-cluster-threshold={threshold}
 roi-top-offset=0
 roi-bottom-offset=0
 detected-min-w=0
@@ -74,9 +74,27 @@ LABELS_TXT = "\n".join(COCO_CLASSES)
 
 
 def write_nvinfer_config(engine_path: str, threshold: float) -> str:
+    """Write nvinfer config file. On Jetson, includes onnx-file for auto-rebuild."""
     config_path = "/tmp/nvinfer_yolo.txt"
+
+    # Check if an ONNX model exists alongside the engine
+    onnx_path = os.environ.get("ONNX_MODEL_PATH", "")
+    if not onnx_path:
+        # Try to derive from engine path
+        candidate = engine_path.replace(".engine", ".onnx").replace("/yolo/", "/onnx/")
+        if os.path.exists(candidate):
+            onnx_path = candidate
+
+    onnx_file_line = ""
+    if onnx_path and os.path.exists(onnx_path):
+        onnx_file_line = f"onnx-file={onnx_path}\n"
+
     with open(config_path, "w") as f:
-        f.write(NVINFER_CONFIG_TMPL.format(engine_path=engine_path, threshold=threshold))
+        f.write(NVINFER_CONFIG_TMPL.format(
+            engine_path=engine_path,
+            threshold=threshold,
+            onnx_file_line=onnx_file_line,
+        ))
     with open("/tmp/labels.txt", "w") as f:
         f.write(LABELS_TXT)
     return config_path
@@ -229,7 +247,7 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     infer.set_property("unique-id", 1)
 
     tracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
-    tracker.set_property("enable-batch-process", True)
+    # Note: 'enable-batch-process' was removed in DS 7.1 — batch processing is now default
 
     fakesink.set_property("sync", False)
     fakesink.set_property("async", False)
@@ -287,6 +305,26 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
 
 # ─── Camera database loader ──────────────────────────────────────────────────
 
+def sanitize_rtsp_url(url: str) -> str:
+    """URL-encode special characters in RTSP userinfo (username:password).
+
+    Handles passwords containing @, #, ?, etc. that would otherwise
+    break the URL parsing.
+    """
+    parsed = urlparse(url)
+    if parsed.username and parsed.password:
+        # Re-encode the password (and username just in case)
+        encoded_user = quote(parsed.username, safe="")
+        encoded_pass = quote(parsed.password, safe="")
+        # Rebuild netloc with encoded credentials
+        host_port = parsed.hostname
+        if parsed.port:
+            host_port = f"{host_port}:{parsed.port}"
+        new_netloc = f"{encoded_user}:{encoded_pass}@{host_port}"
+        return urlunparse(parsed._replace(netloc=new_netloc))
+    return url
+
+
 def load_cameras_from_mongo() -> list:
     """Load enabled cameras from MongoDB at startup."""
     from pymongo import MongoClient
@@ -294,7 +332,8 @@ def load_cameras_from_mongo() -> list:
     db = client["visionpro"]
     cameras = list(db["cameras"].find({"enabled": True}, {"_id": 1, "rtsp_url": 1, "name": 1}))
     client.close()
-    return [{"id": str(c["_id"]), "rtsp_url": c["rtsp_url"], "name": c["name"]} for c in cameras]
+    return [{"id": str(c["_id"]), "rtsp_url": sanitize_rtsp_url(c["rtsp_url"]), "name": c["name"]} for c in cameras]
+
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────

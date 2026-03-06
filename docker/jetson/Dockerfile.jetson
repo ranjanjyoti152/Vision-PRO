@@ -1,0 +1,72 @@
+# ============================================================================
+# Vision Pro NVR – Jetson DeepStream Dockerfile (JetPack 6.0 / L4T R36.x)
+# ============================================================================
+# Uses ONNX as the model interchange format:
+#   .pt → .onnx  (ultralytics export)
+#   .onnx → .engine  (trtexec on-device, FP16)
+#
+# Build:
+#   docker compose -f docker/docker-compose.jetson.yml build deepstream
+# ============================================================================
+
+FROM nvcr.io/nvidia/deepstream:7.1-triton-multiarch
+
+LABEL maintainer="Vision Pro NVR"
+LABEL description="DeepStream GPU pipeline for NVIDIA Jetson – ONNX + TensorRT inference"
+LABEL platform="linux/arm64"
+
+# ── System deps ──────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3-pip \
+        python3-dev \
+        libglib2.0-0 \
+        wget \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Python runtime deps ─────────────────────────────────────────────────────
+RUN pip3 install --no-cache-dir \
+    pyzmq==25.1.2 \
+    numpy \
+    Pillow \
+    ultralytics \
+    onnx \
+    onnxruntime \
+    pymongo \
+    motor \
+    msgpack
+
+# ── Install DeepStream Python bindings (pyds) ───────────────────────────────
+# pyds is NOT included in the DS 7.1 triton-multiarch image.
+# Install the Python 3.10-specific wheel from NVIDIA's official GitHub release.
+RUN pip3 install --no-cache-dir \
+    https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.2.0/pyds-1.2.0-cp310-cp310-linux_aarch64.whl
+
+# ── Model cache directories ─────────────────────────────────────────────────
+RUN mkdir -p /models/yolo /models/faces /models/onnx
+
+WORKDIR /app
+
+# ── Copy application code ───────────────────────────────────────────────────
+COPY backend/app/ /app/app/
+
+# ── Copy Jetson-specific scripts ─────────────────────────────────────────────
+COPY docker/jetson/entrypoint_jetson.sh /entrypoint.sh
+COPY docker/jetson/convert_to_onnx.sh  /convert_to_onnx.sh
+RUN chmod +x /entrypoint.sh /convert_to_onnx.sh
+
+# ── Environment defaults (overridden by compose) ────────────────────────────
+ENV JETSON_MODE=true
+ENV TRT_WORKSPACE_GB=2
+ENV YOLO_PT_PATH=/models/yolo/yolov8n.pt
+ENV ONNX_MODEL_PATH=/models/onnx/yolov8n.onnx
+ENV TRT_ENGINE_PATH=/models/yolo/yolov8n.engine
+ENV DS_ZMQ_ENDPOINT=tcp://*:5570
+ENV CONF_THRESHOLD=0.45
+ENV TARGET_FPS=30
+
+# DeepStream Python bindings path
+ENV PYTHONPATH="/app:/opt/nvidia/deepstream/deepstream/lib"
+ENV LD_LIBRARY_PATH="/opt/nvidia/deepstream/deepstream/lib"
+ENV GI_TYPELIB_PATH="/usr/lib/aarch64-linux-gnu/girepository-1.0"
+
+ENTRYPOINT ["/entrypoint.sh"]
