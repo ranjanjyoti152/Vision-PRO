@@ -18,15 +18,15 @@ motor>=3.6.0
 pymongo>=4.9.0
 
 # Vector Database
-qdrant-client>=1.12.0
+qdrant-client==1.11.3  # 1.12+ has grpc type syntax incompatible with NVIDIA container
 
 # AI / ML (Jetson-compatible)
 ultralytics>=8.3.0
-opencv-python-headless>=4.10.0
-numpy>=1.26.0,<2.0.0
-torch>=2.1.0
+# opencv-python-headless — pre-installed with CUDA in NVIDIA container, do NOT reinstall
+# numpy — pre-installed in NVIDIA container
+# torch — pre-installed with CUDA in NVIDIA container, do NOT reinstall
 insightface>=0.7.3
-onnxruntime>=1.19.0
+onnxruntime==1.19.2  # 1.24.x crashes on aarch64 Jetson
 
 # Image Processing
 Pillow>=10.0.0

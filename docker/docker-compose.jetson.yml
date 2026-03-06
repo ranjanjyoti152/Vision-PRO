@@ -144,6 +144,13 @@ services:
         condition: service_started
     networks:
       - visionpro-net-jetson
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
 volumes:
   mongo_data_jetson:

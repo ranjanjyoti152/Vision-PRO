@@ -1,13 +1,14 @@
 # ============================================================================
-# Vision Pro NVR – Backend Dockerfile (Jetson / ARM64)
+# Vision Pro NVR – Backend Dockerfile (Jetson / ARM64 + CUDA)
 # ============================================================================
 # FastAPI backend with GPU-accelerated AI inference
+# Uses NVIDIA PyTorch igpu image for CUDA support on Jetson (JetPack 6+)
 # ============================================================================
 
-FROM python:3.11-slim
+FROM nvcr.io/nvidia/pytorch:24.09-py3-igpu
 
 LABEL maintainer="Vision Pro NVR"
-LABEL description="FastAPI backend for Vision Pro NVR – Jetson ARM64"
+LABEL description="FastAPI backend for Vision Pro NVR – Jetson ARM64 with CUDA"
 
 # ── System deps ──────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,8 +25,53 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # ── Python dependencies ─────────────────────────────────────────────────────
+# The NVIDIA container ships: torch (CUDA), opencv 4.7.0 (CUDA), numpy 2.x
+#
+# Problem: ultralytics/insightface depend on `opencv-python` which is a
+# DIFFERENT pip package name than the container's `opencv`. pip doesn't
+# recognise the native build and tries to download/install the generic one,
+# overwriting the CUDA-optimised build and breaking cv2.
+#
+# Solution:
+#   1. Create proper dummy dist-info dirs WITH RECORD files so pip thinks
+#      opencv-python & opencv-python-headless 4.7.0 are already installed.
+#   2. Use a pip constraints file to LOCK those versions so pip never
+#      tries to upgrade them (which would trigger uninstall → fail).
+#   3. Downgrade numpy to 1.x for broad compatibility.
+
 COPY backend/requirements.jetson.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Create dummy dist-info for opencv-python
+RUN mkdir -p /usr/local/lib/python3.10/dist-packages/opencv_python-4.7.0.dist-info && \
+    printf 'Metadata-Version: 2.1\nName: opencv-python\nVersion: 4.7.0\n' \
+      > /usr/local/lib/python3.10/dist-packages/opencv_python-4.7.0.dist-info/METADATA && \
+    touch /usr/local/lib/python3.10/dist-packages/opencv_python-4.7.0.dist-info/RECORD && \
+    echo "pip" > /usr/local/lib/python3.10/dist-packages/opencv_python-4.7.0.dist-info/INSTALLER
+
+# Create dummy dist-info for opencv-python-headless
+RUN mkdir -p /usr/local/lib/python3.10/dist-packages/opencv_python_headless-4.7.0.dist-info && \
+    printf 'Metadata-Version: 2.1\nName: opencv-python-headless\nVersion: 4.7.0\n' \
+      > /usr/local/lib/python3.10/dist-packages/opencv_python_headless-4.7.0.dist-info/METADATA && \
+    touch /usr/local/lib/python3.10/dist-packages/opencv_python_headless-4.7.0.dist-info/RECORD && \
+    echo "pip" > /usr/local/lib/python3.10/dist-packages/opencv_python_headless-4.7.0.dist-info/INSTALLER
+
+# Create dummy dist-info for opencv-contrib-python
+RUN mkdir -p /usr/local/lib/python3.10/dist-packages/opencv_contrib_python-4.7.0.dist-info && \
+    printf 'Metadata-Version: 2.1\nName: opencv-contrib-python\nVersion: 4.7.0\n' \
+      > /usr/local/lib/python3.10/dist-packages/opencv_contrib_python-4.7.0.dist-info/METADATA && \
+    touch /usr/local/lib/python3.10/dist-packages/opencv_contrib_python-4.7.0.dist-info/RECORD && \
+    echo "pip" > /usr/local/lib/python3.10/dist-packages/opencv_contrib_python-4.7.0.dist-info/INSTALLER
+
+# Pip constraints: prevent pip from upgrading the faked opencv packages
+RUN printf 'opencv-python==4.7.0\nopencv-python-headless==4.7.0\nopencv-contrib-python==4.7.0\nnumpy==1.26.4\n' \
+      > /tmp/constraints.txt
+
+# Install deps with constraints
+RUN pip install --no-cache-dir 'numpy==1.26.4' && \
+    pip install --no-cache-dir -c /tmp/constraints.txt -r requirements.txt
+
+# Patch cv2 typing stubs: the container's native cv2.dnn has no DictValue attr
+RUN sed -i '/DictValue/d' /usr/local/lib/python3.10/dist-packages/cv2/typing/__init__.py 2>/dev/null || true
 
 # ── Copy application code ───────────────────────────────────────────────────
 COPY backend/ /app/
@@ -40,4 +86,4 @@ ENV BACKEND_PORT=8000
 
 EXPOSE 8000
 
-CMD ["python", "run.py"]
+CMD ["python3", "run.py"]

@@ -127,7 +127,10 @@ class DetectionWorker:
         # Load model synchronously first so we don't block the loop later
         self.engine.load()
         from app.services.face_service import face_engine
-        face_engine.load()
+        try:
+            face_engine.load()
+        except Exception as e:
+            logger.warning(f"⚠️ Face recognition disabled (load failed): {e}")
 
             
         self._running = True
@@ -589,10 +592,10 @@ class DetectionWorker:
         if not detections:
             return
 
-        tracker = self.cooldown_trackers.get(camera_id)
+        tracker = self.cooldowns.get(camera_id)
         if not tracker:
             tracker = CooldownTracker()
-            self.cooldown_trackers[camera_id] = tracker
+            self.cooldowns[camera_id] = tracker
 
         # Pick the highest-confidence detection as the primary event trigger
         primary = max(detections, key=lambda d: d.get("confidence", 0))
@@ -614,18 +617,18 @@ class DetectionWorker:
         bbox_raw = primary.get("bbox", [0, 0, 100, 100])
         primary_bbox = BoundingBox(
             x=int(bbox_raw[0]), y=int(bbox_raw[1]),
-            width=int(bbox_raw[2]), height=int(bbox_raw[3]),
+            w=int(bbox_raw[2]), h=int(bbox_raw[3]),
         )
 
         detected_objs = [
-            DetectedObject(
-                class_name=d.get("class_name", "unknown"),
-                confidence=float(d.get("confidence", 0.0)),
-                bounding_box=BoundingBox(
+            DetectedObject(**{
+                "class": d.get("class_name", "unknown"),
+                "confidence": float(d.get("confidence", 0.0)),
+                "bbox": BoundingBox(
                     x=int(d["bbox"][0]), y=int(d["bbox"][1]),
-                    width=int(d["bbox"][2]), height=int(d["bbox"][3]),
+                    w=int(d["bbox"][2]), h=int(d["bbox"][3]),
                 )
-            )
+            })
             for d in detections
         ]
 

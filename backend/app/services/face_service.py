@@ -8,7 +8,12 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
-from insightface.app import FaceAnalysis
+try:
+    from insightface.app import FaceAnalysis
+    INSIGHTFACE_AVAILABLE = True
+except Exception:
+    FaceAnalysis = None
+    INSIGHTFACE_AVAILABLE = False
 from qdrant_client.models import PointStruct
 
 from app.config import settings
@@ -28,16 +33,25 @@ class FaceEngine:
 
     def load(self):
         """Load InsightFace models into GPU/CPU."""
+        import platform
+        if platform.machine() == 'aarch64':
+            logger.warning("⚠️ Face recognition disabled on aarch64/Jetson (onnxruntime incompatible)")
+            return
+        if not INSIGHTFACE_AVAILABLE:
+            logger.warning("⚠️ InsightFace not available — face recognition disabled")
+            return
         logger.info(f"👤 Loading Face Recognition model: {self.model_name}")
-        
-        # buffalo_l extracts 512-dimensional embeddings
-        self._app = FaceAnalysis(
-            name=self.model_name,
-            root=str(settings.MODELS_DIR),
-            providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
-        )
-        self._app.prepare(ctx_id=0, det_size=(640, 640))
-        logger.info("✅ Face Recognition model loaded")
+        try:
+            self._app = FaceAnalysis(
+                name=self.model_name,
+                root=str(settings.MODELS_DIR),
+                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+            )
+            self._app.prepare(ctx_id=0, det_size=(640, 640))
+            logger.info("✅ Face Recognition model loaded")
+        except Exception as e:
+            logger.warning(f"⚠️ Face recognition disabled (load error): {e}")
+            self._app = None
 
     def extract_embedding(self, image: np.ndarray) -> Optional[np.ndarray]:
         """Detect the largest face in the image and extract its 512D embedding."""

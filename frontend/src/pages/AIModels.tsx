@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import {
     Box, Typography, Grid, Card, CardContent, Button, Chip, IconButton,
     CircularProgress, Dialog, DialogTitle, DialogContent, DialogActions,
@@ -19,6 +19,14 @@ const formatSize = (bytes: number) => {
     return `${(bytes / 1e9).toFixed(2)} GB`;
 };
 
+type DownloadProgress = {
+    modelId: string;
+    modelName: string;
+    status: string;    // queued | downloading | converting | ready | error
+    progress: number;  // 0-100
+    phase: string;     // human-readable phase label
+};
+
 /* ── component ───────────────────────────────────────────────────── */
 
 const AIModels: React.FC = () => {
@@ -27,7 +35,10 @@ const AIModels: React.FC = () => {
     const [activeModel, setActiveModel] = useState<any>(null);
     const [loading, setLoading] = useState(true);
     const [uploading, setUploading] = useState(false);
-    const [downloadingModels, setDownloadingModels] = useState<Set<string>>(new Set());
+
+    // Download progress tracking
+    const [downloads, setDownloads] = useState<Map<string, DownloadProgress>>(new Map());
+    const pollTimers = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
 
     // Dialogs
     const [uploadOpen, setUploadOpen] = useState(false);
@@ -45,11 +56,84 @@ const AIModels: React.FC = () => {
             setModels(m.data);
             setAvailable(a.data);
             setActiveModel(act.data);
+
+            // Auto-resume polling for models that are still in progress
+            for (const model of m.data) {
+                const status = model.metadata?.status;
+                if (status && !['ready', 'error'].includes(status) && !pollTimers.current.has(model.id)) {
+                    startPolling(model.id, model.name);
+                }
+            }
         } catch { /* ignore */ }
         setLoading(false);
     }, []);
 
     useEffect(() => { fetchData(); }, [fetchData]);
+
+    // Cleanup poll timers on unmount
+    useEffect(() => {
+        return () => {
+            pollTimers.current.forEach(timer => clearInterval(timer));
+            pollTimers.current.clear();
+        };
+    }, []);
+
+    const startPolling = (modelId: string, modelName: string) => {
+        // Don't duplicate timers
+        if (pollTimers.current.has(modelName)) return;
+
+        // Set initial state
+        setDownloads(prev => {
+            const next = new Map(prev);
+            next.set(modelName, { modelId, modelName, status: 'queued', progress: 0, phase: 'Starting...' });
+            return next;
+        });
+
+        const timer = setInterval(async () => {
+            try {
+                const res = await modelsApi.getProgress(modelId);
+                const data = res.data;
+
+                setDownloads(prev => {
+                    const next = new Map(prev);
+                    next.set(modelName, {
+                        modelId: data.model_id,
+                        modelName: data.name,
+                        status: data.status,
+                        progress: data.progress,
+                        phase: data.phase,
+                    });
+                    return next;
+                });
+
+                // Stop polling when done or error
+                if (['ready', 'error'].includes(data.status)) {
+                    clearInterval(timer);
+                    pollTimers.current.delete(modelName);
+
+                    if (data.status === 'ready') {
+                        showSnack(`${data.name} downloaded successfully`);
+                    } else {
+                        showSnack(`${data.name}: ${data.phase}`, 'error');
+                    }
+
+                    // Remove from downloads map after a delay to show completion
+                    setTimeout(() => {
+                        setDownloads(prev => {
+                            const next = new Map(prev);
+                            next.delete(modelName);
+                            return next;
+                        });
+                        fetchData(); // Refresh the models list
+                    }, 2000);
+                }
+            } catch {
+                // ignore poll errors
+            }
+        }, 2000);
+
+        pollTimers.current.set(modelName, timer);
+    };
 
     const handleSetDefault = async (id: string) => {
         try {
@@ -69,16 +153,15 @@ const AIModels: React.FC = () => {
     };
 
     const handleDownload = async (modelName: string) => {
-        setDownloadingModels(prev => new Set(prev).add(modelName));
         try {
             const res = await modelsApi.download(modelName);
-            showSnack(res.data.message);
-            fetchData();
+            const modelId = res.data.model_id;
+            showSnack(res.data.message, 'info');
+            startPolling(modelId, modelName);
         } catch (e: any) {
             const msg = e.response?.data?.detail || 'Download failed';
             showSnack(msg, msg.includes('already') ? 'info' : 'error');
         }
-        setDownloadingModels(prev => { const s = new Set(prev); s.delete(modelName); return s; });
     };
 
     const handleUpload = async () => {
@@ -109,6 +192,26 @@ const AIModels: React.FC = () => {
     const allAvailable = Object.entries(available).flatMap(([family, variants]) =>
         (variants as string[]).map(v => ({ family, name: v }))
     );
+
+    // Get progress status color
+    const getProgressColor = (status: string) => {
+        switch (status) {
+            case 'downloading': return '#4F8EF7';
+            case 'converting': return '#FF9800';
+            case 'ready': return '#00E676';
+            case 'error': return '#FF5252';
+            default: return '#4F8EF7';
+        }
+    };
+
+    const getProgressGradient = (status: string) => {
+        switch (status) {
+            case 'downloading': return 'linear-gradient(90deg, #4F8EF7, #7C4DFF)';
+            case 'converting': return 'linear-gradient(90deg, #FF9800, #FF5722)';
+            case 'ready': return 'linear-gradient(90deg, #00E676, #69F0AE)';
+            default: return 'linear-gradient(90deg, #4F8EF7, #7C4DFF)';
+        }
+    };
 
     return (
         <Box>
@@ -174,13 +277,94 @@ const AIModels: React.FC = () => {
                 <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}><CircularProgress /></Box>
             ) : (
                 <>
+                    {/* ── Active Downloads / Conversions ──────────── */}
+                    {downloads.size > 0 && (
+                        <Box sx={{ mb: 3 }}>
+                            <Typography variant="h6" sx={{ mb: 2, fontWeight: 700 }}>
+                                In Progress
+                                <Chip label={downloads.size} size="small" sx={{ ml: 1, height: 22, fontSize: 11, background: 'rgba(255,152,0,0.12)', color: '#FF9800' }} />
+                            </Typography>
+                            <Grid container spacing={2}>
+                                {Array.from(downloads.values()).map(dl => (
+                                    <Grid size={{ xs: 12, sm: 6, md: 4 }} key={dl.modelName}>
+                                        <Card sx={{
+                                            border: `1px solid ${getProgressColor(dl.status)}33`,
+                                            background: `${getProgressColor(dl.status)}08`,
+                                        }}>
+                                            <CardContent sx={{ p: 2.5, '&:last-child': { pb: 2.5 } }}>
+                                                <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1.5 }}>
+                                                    <Box>
+                                                        <Typography variant="subtitle1" sx={{ fontWeight: 700 }}>{dl.modelName}</Typography>
+                                                        <Typography variant="caption" sx={{
+                                                            color: getProgressColor(dl.status),
+                                                            fontWeight: 600,
+                                                            fontSize: '0.7rem',
+                                                        }}>
+                                                            {dl.phase}
+                                                        </Typography>
+                                                    </Box>
+                                                    <Box sx={{ position: 'relative', display: 'inline-flex' }}>
+                                                        <CircularProgress
+                                                            variant="determinate"
+                                                            value={dl.progress}
+                                                            size={44}
+                                                            thickness={4}
+                                                            sx={{
+                                                                color: getProgressColor(dl.status),
+                                                                '& .MuiCircularProgress-circle': { strokeLinecap: 'round' },
+                                                            }}
+                                                        />
+                                                        <Box sx={{
+                                                            top: 0, left: 0, bottom: 0, right: 0,
+                                                            position: 'absolute',
+                                                            display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                                        }}>
+                                                            <Typography variant="caption" sx={{ fontSize: '0.6rem', fontWeight: 700, color: 'text.secondary' }}>
+                                                                {dl.progress}%
+                                                            </Typography>
+                                                        </Box>
+                                                    </Box>
+                                                </Stack>
+                                                <LinearProgress
+                                                    variant="determinate"
+                                                    value={dl.progress}
+                                                    sx={{
+                                                        borderRadius: 4, height: 6,
+                                                        background: 'rgba(255,255,255,0.05)',
+                                                        '& .MuiLinearProgress-bar': {
+                                                            background: getProgressGradient(dl.status),
+                                                            borderRadius: 4,
+                                                            transition: 'transform 0.5s ease',
+                                                        },
+                                                    }}
+                                                />
+                                                <Stack direction="row" justifyContent="space-between" sx={{ mt: 0.5 }}>
+                                                    <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.6rem', textTransform: 'uppercase' }}>
+                                                        {dl.status === 'downloading' ? '📦 Downloading' :
+                                                            dl.status === 'converting' ? '⚙️ Converting' :
+                                                                dl.status === 'ready' ? '✅ Complete' :
+                                                                    dl.status === 'error' ? '❌ Failed' : '⏳ Queued'}
+                                                    </Typography>
+                                                    <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.6rem' }}>
+                                                        {dl.progress}%
+                                                    </Typography>
+                                                </Stack>
+                                            </CardContent>
+                                        </Card>
+                                    </Grid>
+                                ))}
+                            </Grid>
+                        </Box>
+                    )}
+
                     {/* ── Downloaded Models ─────────────────────── */}
                     <Typography variant="h6" sx={{ mb: 2, fontWeight: 700 }}>
                         Downloaded Models
-                        <Chip label={models.length} size="small" sx={{ ml: 1, height: 22, fontSize: 11, background: 'rgba(79,142,247,0.12)', color: '#4F8EF7' }} />
+                        <Chip label={models.filter(m => m.metadata?.status === 'ready' || !m.metadata?.status).length} size="small"
+                            sx={{ ml: 1, height: 22, fontSize: 11, background: 'rgba(79,142,247,0.12)', color: '#4F8EF7' }} />
                     </Typography>
 
-                    {models.length === 0 ? (
+                    {models.filter(m => m.metadata?.status === 'ready' || !m.metadata?.status || m.metadata?.status === undefined).length === 0 ? (
                         <Card sx={{ mb: 4 }}>
                             <CardContent sx={{ p: 5, textAlign: 'center' }}>
                                 <SmartToy sx={{ fontSize: 56, color: 'text.secondary', mb: 1, opacity: 0.4 }} />
@@ -190,7 +374,7 @@ const AIModels: React.FC = () => {
                         </Card>
                     ) : (
                         <Grid container spacing={2} sx={{ mb: 4 }}>
-                            {models.map(m => {
+                            {models.filter(m => m.metadata?.status === 'ready' || !m.metadata?.status || m.metadata?.status === undefined).map(m => {
                                 const isActive = activeModel?.model_name === m.name;
                                 return (
                                     <Grid size={{ xs: 12, sm: 6, md: 4, lg: 3 }} key={m.id}>
@@ -273,17 +457,20 @@ const AIModels: React.FC = () => {
                     <Grid container spacing={2}>
                         {allAvailable.map(({ family, name }) => {
                             const downloaded = models.some(m => m.name === name);
-                            const isDownloading = downloadingModels.has(name);
+                            const dl = downloads.get(name);
+                            const isInProgress = !!dl;
                             return (
                                 <Grid size={{ xs: 12, sm: 6, md: 4, lg: 3 }} key={name}>
                                     <Card sx={{
                                         transition: 'all 0.2s',
                                         opacity: downloaded ? 0.7 : 1,
-                                        border: downloaded ? '1px solid rgba(0,230,118,0.2)' : '1px solid rgba(148,163,184,0.08)',
-                                        '&:hover': !downloaded ? { borderColor: 'primary.main', transform: 'translateY(-1px)' } : {},
+                                        border: downloaded ? '1px solid rgba(0,230,118,0.2)'
+                                            : isInProgress ? `1px solid ${getProgressColor(dl!.status)}44`
+                                                : '1px solid rgba(148,163,184,0.08)',
+                                        '&:hover': !downloaded && !isInProgress ? { borderColor: 'primary.main', transform: 'translateY(-1px)' } : {},
                                     }}>
                                         <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
-                                            <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: isDownloading ? 1 : 0 }}>
+                                            <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: isInProgress ? 1 : 0 }}>
                                                 <Box>
                                                     <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>{name}</Typography>
                                                     <Typography variant="caption" color="text.secondary" sx={{ textTransform: 'uppercase', letterSpacing: 0.5, fontSize: '0.6rem' }}>
@@ -293,9 +480,17 @@ const AIModels: React.FC = () => {
                                                 {downloaded ? (
                                                     <Chip icon={<CheckCircle sx={{ fontSize: 14 }} />} label="Downloaded" size="small"
                                                         sx={{ height: 24, fontSize: 10, fontWeight: 600, background: 'rgba(0,230,118,0.12)', color: '#00E676' }} />
-                                                ) : isDownloading ? (
-                                                    <Chip icon={<CircularProgress size={12} sx={{ color: '#4F8EF7' }} />} label="Downloading..."
-                                                        size="small" sx={{ height: 24, fontSize: 10, fontWeight: 600, background: 'rgba(79,142,247,0.12)', color: '#4F8EF7' }} />
+                                                ) : isInProgress ? (
+                                                    <Chip
+                                                        icon={<CircularProgress size={12} sx={{ color: getProgressColor(dl!.status) }} />}
+                                                        label={`${dl!.progress}%`}
+                                                        size="small"
+                                                        sx={{
+                                                            height: 24, fontSize: 10, fontWeight: 700,
+                                                            background: `${getProgressColor(dl!.status)}18`,
+                                                            color: getProgressColor(dl!.status),
+                                                        }}
+                                                    />
                                                 ) : (
                                                     <Button size="small" variant="outlined" startIcon={<CloudDownload sx={{ fontSize: 16 }} />}
                                                         onClick={() => handleDownload(name)}
@@ -306,14 +501,29 @@ const AIModels: React.FC = () => {
                                             </Stack>
 
                                             {/* Download progress bar */}
-                                            {isDownloading && (
-                                                <LinearProgress
-                                                    sx={{
-                                                        borderRadius: 4, height: 4,
-                                                        background: 'rgba(79,142,247,0.1)',
-                                                        '& .MuiLinearProgress-bar': { background: 'linear-gradient(90deg, #4F8EF7, #7C4DFF)' },
-                                                    }}
-                                                />
+                                            {isInProgress && (
+                                                <Box>
+                                                    <LinearProgress
+                                                        variant="determinate"
+                                                        value={dl!.progress}
+                                                        sx={{
+                                                            borderRadius: 4, height: 4, mb: 0.5,
+                                                            background: 'rgba(255,255,255,0.04)',
+                                                            '& .MuiLinearProgress-bar': {
+                                                                background: getProgressGradient(dl!.status),
+                                                                borderRadius: 4,
+                                                                transition: 'transform 0.5s ease',
+                                                            },
+                                                        }}
+                                                    />
+                                                    <Typography variant="caption" sx={{
+                                                        fontSize: '0.6rem',
+                                                        color: getProgressColor(dl!.status),
+                                                        fontWeight: 600,
+                                                    }}>
+                                                        {dl!.phase}
+                                                    </Typography>
+                                                </Box>
                                             )}
                                         </CardContent>
                                     </Card>

@@ -80,6 +80,14 @@ class DeepStreamReceiver:
                     jpeg       = msg.get("jpeg")
                     timestamp  = msg.get("timestamp", time.time())
                     if detections:
+                        # Broadcast detections to frontend via WebSocket
+                        det_channel = f"detections:{camera_id}"
+                        await ws_manager.broadcast_to_channel(det_channel, {
+                            "camera_id": camera_id,
+                            "detections": detections,
+                            "timestamp": timestamp,
+                        })
+                        # Route through event pipeline
                         asyncio.create_task(
                             self._handle_detections(camera_id, detections, jpeg, timestamp)
                         )

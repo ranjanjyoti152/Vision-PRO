@@ -16,6 +16,7 @@ import logging
 import threading
 import time
 import io
+import ctypes
 from typing import Dict, Optional
 
 import gi
@@ -45,6 +46,24 @@ TARGET_FPS     = int(os.environ.get("TARGET_FPS", "30"))
 
 # Globals
 bridge: Optional[DeepStreamBridge] = None
+MODEL_CLASSES: list = []  # populated at startup from .pt model
+NUM_CLASSES: int = 80
+_latest_jpeg: Dict[str, bytes] = {}  # camera_id → most recent JPEG for snapshots
+
+
+def detect_model_classes() -> list:
+    """Auto-detect class names from the .pt model file."""
+    pt_path = os.environ.get("YOLO_PT_PATH", "/models/yolo/yolov8n.pt")
+    try:
+        from ultralytics import YOLO
+        model = YOLO(pt_path)
+        names = model.names  # {0: 'class1', 1: 'class2', ...}
+        class_list = [names[i] for i in sorted(names.keys())]
+        logger.info(f"🏷️  Detected {len(class_list)} classes from {pt_path}: {class_list}")
+        return class_list
+    except Exception as e:
+        logger.warning(f"Could not detect classes from {pt_path}: {e}")
+        return list(COCO_CLASSES)
 
 
 # ─── nvinfer config ────────────────────────────────────────────────────────
@@ -56,11 +75,11 @@ net-scale-factor=0.0039215697906911373
 model-engine-file={engine_path}
 {onnx_file_line}labelfile-path=/tmp/labels.txt
 batch-size=1
-network-type=0
-num-detected-classes=80
+network-type=100
+num-detected-classes={num_classes}
 interval=0
 gie-unique-id=1
-force-implicit-batch-dim=1
+output-tensor-meta=1
 
 [class-attrs-all]
 pre-cluster-threshold={threshold}
@@ -70,17 +89,14 @@ detected-min-w=0
 detected-min-h=0
 """
 
-LABELS_TXT = "\n".join(COCO_CLASSES)
 
-
-def write_nvinfer_config(engine_path: str, threshold: float) -> str:
+def write_nvinfer_config(engine_path: str, threshold: float, num_classes: int) -> str:
     """Write nvinfer config file. On Jetson, includes onnx-file for auto-rebuild."""
     config_path = "/tmp/nvinfer_yolo.txt"
 
     # Check if an ONNX model exists alongside the engine
     onnx_path = os.environ.get("ONNX_MODEL_PATH", "")
     if not onnx_path:
-        # Try to derive from engine path
         candidate = engine_path.replace(".engine", ".onnx").replace("/yolo/", "/onnx/")
         if os.path.exists(candidate):
             onnx_path = candidate
@@ -94,16 +110,114 @@ def write_nvinfer_config(engine_path: str, threshold: float) -> str:
             engine_path=engine_path,
             threshold=threshold,
             onnx_file_line=onnx_file_line,
+            num_classes=num_classes,
         ))
     with open("/tmp/labels.txt", "w") as f:
-        f.write(LABELS_TXT)
+        f.write("\n".join(MODEL_CLASSES))
     return config_path
 
 
-# ─── Pad probe — extract bounding boxes ─────────────────────────────────────
+# ─── YOLO tensor parsing ─────────────────────────────────────────────────────
+
+def _nms_boxes(boxes, scores, iou_threshold=0.45):
+    """Simple NMS. boxes: Nx4 [x1,y1,x2,y2], scores: N."""
+    if len(boxes) == 0:
+        return []
+    x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        if order.size == 1:
+            break
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    return keep
+
+
+def parse_yolo_tensor(tensor_data: np.ndarray, conf_threshold: float, img_w: int, img_h: int):
+    """
+    Parse raw YOLO output tensor [1, (4+num_classes), num_anchors] → list of detections.
+
+    Ultralytics YOLOv8/v11 output format:
+        Each anchor: [cx, cy, w, h, class0_conf, class1_conf, ...]
+        Coordinates are in model input space (640x640 typically).
+    """
+    # Squeeze batch dim: (4+C, 8400)
+    if tensor_data.ndim == 3:
+        tensor_data = tensor_data[0]
+    n_vals, n_anchors = tensor_data.shape  # e.g. (19, 8400)
+    n_classes = n_vals - 4
+
+    # Transpose to (8400, 19) for easier processing
+    preds = tensor_data.T  # (8400, 19)
+
+    # Extract bbox (cx, cy, w, h) and class confidences
+    cx, cy, w, h = preds[:, 0], preds[:, 1], preds[:, 2], preds[:, 3]
+    class_confs = preds[:, 4:]  # (8400, num_classes)
+
+    # Get best class per anchor
+    class_ids = np.argmax(class_confs, axis=1)
+    max_confs = class_confs[np.arange(n_anchors), class_ids]
+
+    # Filter by confidence
+    mask = max_confs > conf_threshold
+    if not mask.any():
+        return []
+
+    cx, cy, w, h = cx[mask], cy[mask], w[mask], h[mask]
+    class_ids = class_ids[mask]
+    max_confs = max_confs[mask]
+
+    # Convert to x1, y1, x2, y2 and scale to image dimensions
+    scale_x = img_w / 640.0
+    scale_y = img_h / 640.0
+    x1 = (cx - w / 2) * scale_x
+    y1 = (cy - h / 2) * scale_y
+    x2 = (cx + w / 2) * scale_x
+    y2 = (cy + h / 2) * scale_y
+
+    boxes = np.stack([x1, y1, x2, y2], axis=1)
+
+    # NMS per class
+    final_dets = []
+    for cls_id in np.unique(class_ids):
+        cls_mask = class_ids == cls_id
+        cls_boxes = boxes[cls_mask]
+        cls_scores = max_confs[cls_mask]
+        keep = _nms_boxes(cls_boxes, cls_scores, iou_threshold=0.45)
+        for k in keep:
+            bx = cls_boxes[k]
+            final_dets.append({
+                "class_id": int(cls_id),
+                "class_name": MODEL_CLASSES[int(cls_id)] if int(cls_id) < len(MODEL_CLASSES) else f"class_{cls_id}",
+                "event_type": EVENT_CLASS_MAP.get(
+                    MODEL_CLASSES[int(cls_id)] if int(cls_id) < len(MODEL_CLASSES) else "", "custom"
+                ),
+                "confidence": round(float(cls_scores[k]), 4),
+                "bbox": [
+                    round(float(max(0, bx[0])), 1),
+                    round(float(max(0, bx[1])), 1),
+                    round(float(bx[2] - bx[0]), 1),
+                    round(float(bx[3] - bx[1]), 1),
+                ],
+                "track_id": None,
+            })
+    return final_dets
+
+
+# ─── Pad probe — extract raw output tensors ──────────────────────────────────
 
 def osd_sink_pad_buffer_probe(pad, info, camera_id):
-    """Extract NvDsObjectMeta detections and publish to FastAPI via ZMQ."""
+    """Extract raw YOLO tensor from nvinfer output-tensor-meta and parse detections."""
     gst_buffer = info.get_buffer()
     if not gst_buffer:
         return Gst.PadProbeReturn.OK
@@ -119,40 +233,70 @@ def osd_sink_pad_buffer_probe(pad, info, camera_id):
         except StopIteration:
             break
 
+        # Get image dimensions from streammux
+        img_w = frame_meta.source_frame_width or 1920
+        img_h = frame_meta.source_frame_height or 1080
+
         detections = []
-        l_obj = frame_meta.obj_meta_list
-        while l_obj:
+
+        # Try to read raw tensor output from nvinfer (output-tensor-meta=1)
+        l_user = frame_meta.frame_user_meta_list
+        while l_user:
             try:
-                obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                user_meta = pyds.NvDsUserMeta.cast(l_user.data)
+                if user_meta.base_meta.meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
+                    tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
+                    # Get first output layer
+                    layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
+                    ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
+                    # Build numpy array from layer dims
+                    dims = [layer.dims.d[i] for i in range(layer.dims.numDims)]
+                    total = 1
+                    for d in dims:
+                        total *= d
+                    arr = np.ctypeslib.as_array(ptr, shape=(total,)).reshape(dims).copy()
+                    detections = parse_yolo_tensor(arr, CONF_THRESHOLD, img_w, img_h)
+            except Exception as e:
+                logger.debug(f"Tensor parse error: {e}")
+
+            try:
+                l_user = l_user.next
             except StopIteration:
                 break
 
-            class_id = obj_meta.class_id
-            class_name = COCO_CLASSES[class_id] if class_id < len(COCO_CLASSES) else f"class_{class_id}"
-            conf = obj_meta.confidence
-            rect = obj_meta.rect_params
-
-            detections.append({
-                "class_id":   class_id,
-                "class_name": class_name,
-                "event_type": EVENT_CLASS_MAP.get(class_name, "custom"),
-                "confidence": round(float(conf), 4),
-                "bbox":       [
-                    round(float(rect.left), 1),
-                    round(float(rect.top), 1),
-                    round(float(rect.width), 1),
-                    round(float(rect.height), 1),
-                ],
-                "track_id":  obj_meta.object_id if obj_meta.object_id != 0xFFFFFFFFFFFFFFFF else None,
-            })
-
-            try:
-                l_obj = l_obj.next
-            except StopIteration:
-                break
+        # Fallback: also check NvDsObjectMeta (works if parser is available)
+        if not detections:
+            l_obj = frame_meta.obj_meta_list
+            while l_obj:
+                try:
+                    obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
+                    class_id = obj_meta.class_id
+                    class_name = MODEL_CLASSES[class_id] if class_id < len(MODEL_CLASSES) else f"class_{class_id}"
+                    conf = obj_meta.confidence
+                    rect = obj_meta.rect_params
+                    detections.append({
+                        "class_id":   class_id,
+                        "class_name": class_name,
+                        "event_type": EVENT_CLASS_MAP.get(class_name, "custom"),
+                        "confidence": round(float(conf), 4),
+                        "bbox":       [
+                            round(float(rect.left), 1),
+                            round(float(rect.top), 1),
+                            round(float(rect.width), 1),
+                            round(float(rect.height), 1),
+                        ],
+                        "track_id":  obj_meta.object_id if obj_meta.object_id != 0xFFFFFFFFFFFFFFFF else None,
+                    })
+                except StopIteration:
+                    break
+                try:
+                    l_obj = l_obj.next
+                except StopIteration:
+                    break
 
         if detections and bridge:
-            bridge.publish_detections(camera_id, detections)
+            jpeg = _latest_jpeg.get(camera_id)
+            bridge.publish_detections(camera_id, detections, jpeg=jpeg)
 
         try:
             l_frame = l_frame.next
@@ -186,6 +330,7 @@ def on_new_sample(appsink, camera_id: str):
         buf_io = io.BytesIO()
         img.save(buf_io, format="JPEG", quality=JPEG_QUALITY)
         jpeg = buf_io.getvalue()
+        _latest_jpeg[camera_id] = jpeg  # cache for detection snapshots
         if bridge:
             bridge.publish_frame(camera_id, jpeg)
     except Exception as e:
@@ -219,14 +364,20 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     caps1    = make("capsfilter",     f"caps1_{safe_id}")
     caps1.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=NV12"))
 
+    # nvstreammux — REQUIRED by nvinfer to generate NvDsBatchMeta
+    streammux = make("nvstreammux",   f"mux_{safe_id}")
+    streammux.set_property("batch-size", 1)
+    streammux.set_property("width", 1920)
+    streammux.set_property("height", 1080)
+    streammux.set_property("batched-push-timeout", 40000)  # 40ms = 25fps max
+    streammux.set_property("live-source", True)
+
     # Tee — split decoded stream to inference and JPEG encode
     tee      = make("tee",            f"tee_{safe_id}")
 
-    # Branch 1 — inference
+    # Branch 1 — inference (no tracker with network-type=100)
     queue1   = make("queue",          f"q_inf_{safe_id}")
     infer    = make("nvinfer",        f"nvinfer_{safe_id}")
-    tracker  = make("nvtracker",      f"tracker_{safe_id}")
-    tiler    = make("nvvideoconvert", f"conv_inf_{safe_id}")
     fakesink = make("fakesink",       f"fsink_{safe_id}")
 
     # Branch 2 — JPEG for WebSocket
@@ -235,6 +386,11 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     caps2    = make("capsfilter",     f"caps2_{safe_id}")
     caps2.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGB"))
     appsink  = make("appsink",        f"appsink_{safe_id}")
+
+    # Set compute-hw=1 (GPU) on all nvvideoconvert elements
+    # Default uses VIC which doesn't support RGB/BGR on Jetson
+    for conv in [conv1, conv2]:
+        conv.set_property("compute-hw", 1)
 
     # Config
     src.set_property("location", rtsp_url)
@@ -245,9 +401,6 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
 
     infer.set_property("config-file-path", nvinfer_config)
     infer.set_property("unique-id", 1)
-
-    tracker.set_property("ll-lib-file", "/opt/nvidia/deepstream/deepstream/lib/libnvds_nvmultiobjecttracker.so")
-    # Note: 'enable-batch-process' was removed in DS 7.1 — batch processing is now default
 
     fakesink.set_property("sync", False)
     fakesink.set_property("async", False)
@@ -260,7 +413,7 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
 
     # Add all to pipeline
     for el in [src, depay, parse, decoder, conv1, caps1, tee,
-               queue1, infer, tracker, tiler, fakesink,
+               queue1, streammux, infer, fakesink,
                queue2, conv2, caps2, appsink]:
         pipeline.add(el)
 
@@ -272,21 +425,27 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
 
     src.connect("pad-added", on_pad_added)
 
-    # Link main chain
+    # Link main chain: src → depay → parse → decoder → conv1 → caps1 → tee
     depay.link(parse)
     parse.link(decoder)
     decoder.link(conv1)
     conv1.link(caps1)
     caps1.link(tee)
 
-    # Tee → branch 1 (inference)
+    # Tee → branch 1 (inference via streammux)
     tee_src1 = tee.get_request_pad("src_%u")
     queue1_sink = queue1.get_static_pad("sink")
     tee_src1.link(queue1_sink)
-    queue1.link(infer)
-    infer.link(tracker)
-    tracker.link(tiler)
-    tiler.link(fakesink)
+
+    # queue1 → streammux (pad request) → nvinfer → tracker → conv_inf → fakesink
+    mux_sinkpad = streammux.request_pad_simple("sink_0")
+    if not mux_sinkpad:
+        mux_sinkpad = streammux.get_request_pad("sink_0")
+    queue1_src = queue1.get_static_pad("src")
+    queue1_src.link(mux_sinkpad)
+
+    streammux.link(infer)
+    infer.link(fakesink)
 
     # Tee → branch 2 (JPEG)
     tee_src2 = tee.get_request_pad("src_%u")
@@ -296,9 +455,9 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     conv2.link(caps2)
     caps2.link(appsink)
 
-    # Add pad probe on tracker sink for detection metadata
-    tracker_sink = tracker.get_static_pad("sink")
-    tracker_sink.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, camera_id)
+    # Add pad probe on nvinfer src pad for raw tensor detection metadata
+    infer_src = infer.get_static_pad("src")
+    infer_src.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, camera_id)
 
     return pipeline
 
@@ -347,8 +506,11 @@ def main():
     logger.info("🔧 Checking TensorRT engine ...")
     convert_if_needed()
 
-    # Write nvinfer config
-    nvinfer_config = write_nvinfer_config(ENGINE_PATH, CONF_THRESHOLD)
+    # Detect model classes and write nvinfer config
+    global MODEL_CLASSES, NUM_CLASSES
+    MODEL_CLASSES = detect_model_classes()
+    NUM_CLASSES = len(MODEL_CLASSES)
+    nvinfer_config = write_nvinfer_config(ENGINE_PATH, CONF_THRESHOLD, NUM_CLASSES)
 
     # Connect ZMQ bridge
     bridge = DeepStreamBridge(ZMQ_ENDPOINT)
