@@ -198,6 +198,15 @@ async def get_snapshot(camera_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Camera not found")
 
     jpeg = stream_manager.get_snapshot(camera_id)
+
+    # Fallback: try DeepStream receiver's cached frame
+    if jpeg is None:
+        try:
+            from app.deepstream.receiver import deepstream_receiver
+            jpeg = deepstream_receiver.get_snapshot(camera_id)
+        except Exception:
+            pass
+
     if jpeg is None:
         raise HTTPException(status_code=503, detail="No frame available – stream may be offline")
 

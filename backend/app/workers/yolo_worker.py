@@ -583,14 +583,30 @@ class DetectionWorker:
         detections: list,
         jpeg: Optional[bytes],
         timestamp: float,
+        frame_width: int = 1920,
+        frame_height: int = 1080,
     ) -> None:
         """
         Entry point called by the DeepStream ZMQ receiver.
         Mirrors _process_results() but works from pre-parsed detection dicts
         produced by the GStreamer pad probe (no OpenCV / PyTorch needed here).
+        Events ONLY fire when a detection falls inside an active ROI zone.
         """
         if not detections:
             return
+
+        # ── ROI Zone Check ────────────────────────────────────────────
+        # Load the ROI zones for this camera (cached, refreshes every 30s)
+        zones = await self._load_roi_zones(camera_id)
+        if zones:
+            # Filter detections to only those inside an ROI zone
+            roi_detections = self._filter_detections_by_roi(
+                detections, zones, frame_width, frame_height
+            )
+            if not roi_detections:
+                return  # No detections inside any ROI — skip event
+            detections = roi_detections
+        # If NO zones defined for this camera, allow all detections through
 
         tracker = self.cooldowns.get(camera_id)
         if not tracker:
@@ -640,6 +656,55 @@ class DetectionWorker:
             detected_objs=detected_objs,
             jpeg=jpeg,
         )
+
+    def _filter_detections_by_roi(
+        self, detections: list, zones: list, frame_w: int, frame_h: int
+    ) -> list:
+        """Return only detections whose center falls inside at least one ROI zone."""
+        import time as _time
+        now = _time.time()
+        matched = []
+
+        for det in detections:
+            bbox = det.get("bbox", [0, 0, 0, 0])
+            # bbox = [left, top, width, height]
+            cx = bbox[0] + bbox[2] / 2.0
+            cy = bbox[1] + bbox[3] / 2.0
+            class_name = det.get("class_name", "")
+
+            for zone in zones:
+                zone_id = str(zone.get("_id", ""))
+                trigger_classes = zone.get("trigger_classes", [])
+                zone_points = zone.get("points", [])
+                if len(zone_points) < 3:
+                    continue
+
+                # Per-zone cooldown
+                last_trigger = self._roi_cooldowns.get(zone_id, 0)
+                if now - last_trigger < 30:
+                    continue
+
+                # Check if class matches trigger list
+                mapped = self._map_class_to_event_type(class_name)
+                if class_name not in trigger_classes and mapped.value not in trigger_classes:
+                    continue
+
+                # Convert normalised zone points to pixel coordinates
+                polygon = np.array(
+                    [[int(p[0] * frame_w), int(p[1] * frame_h)] for p in zone_points],
+                    dtype=np.int32,
+                )
+
+                # Point-in-polygon test
+                result = cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False)
+                if result >= 0:
+                    self._roi_cooldowns[zone_id] = now
+                    zone_name = zone.get("name", "ROI Zone")
+                    logger.info(f"🎯 ROI triggered: '{zone_name}' — {class_name} in zone on cam {det.get('camera_id', '')}")
+                    matched.append(det)
+                    break  # One zone match is enough for this detection
+
+        return matched
 
     async def _save_video_clip(
         self, cam_id: str, event_uuid: str, event_oid, current_frame: np.ndarray

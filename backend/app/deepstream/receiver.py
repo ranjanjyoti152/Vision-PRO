@@ -31,6 +31,11 @@ class DeepStreamReceiver:
         self._sock: Optional[zmq.asyncio.Socket]  = None
         self._task: Optional[asyncio.Task]         = None
         self._running = False
+        self._latest_frames: dict[str, bytes] = {}  # camera_id → latest JPEG
+
+    def get_snapshot(self, camera_id: str) -> Optional[bytes]:
+        """Return the most recent JPEG frame for a camera (for snapshot endpoints)."""
+        return self._latest_frames.get(camera_id)
 
     def start(self) -> None:
         if self._running:
@@ -72,13 +77,16 @@ class DeepStreamReceiver:
                 if msg_type == "frame":
                     jpeg = msg.get("jpeg")
                     if jpeg:
+                        self._latest_frames[camera_id] = jpeg  # cache for snapshots
                         channel = f"camera:{camera_id}"
                         await ws_manager.broadcast_bytes(channel, jpeg)
 
                 elif msg_type == "detection":
-                    detections = msg.get("detections", [])
-                    jpeg       = msg.get("jpeg")
-                    timestamp  = msg.get("timestamp", time.time())
+                    detections   = msg.get("detections", [])
+                    jpeg         = msg.get("jpeg")
+                    timestamp    = msg.get("timestamp", time.time())
+                    frame_width  = msg.get("frame_width", 1920)
+                    frame_height = msg.get("frame_height", 1080)
                     if detections:
                         # Broadcast detections to frontend via WebSocket
                         det_channel = f"detections:{camera_id}"
@@ -89,7 +97,8 @@ class DeepStreamReceiver:
                         })
                         # Route through event pipeline
                         asyncio.create_task(
-                            self._handle_detections(camera_id, detections, jpeg, timestamp)
+                            self._handle_detections(camera_id, detections, jpeg,
+                                                    timestamp, frame_width, frame_height)
                         )
 
             except asyncio.TimeoutError:
@@ -106,6 +115,8 @@ class DeepStreamReceiver:
         detections: list,
         jpeg: Optional[bytes],
         timestamp: float,
+        frame_width: int = 1920,
+        frame_height: int = 1080,
     ) -> None:
         """Route detections through the existing event pipeline."""
         try:
@@ -115,6 +126,8 @@ class DeepStreamReceiver:
                 detections=detections,
                 jpeg=jpeg,
                 timestamp=timestamp,
+                frame_width=frame_width,
+                frame_height=frame_height,
             )
         except Exception as e:
             logger.warning(f"Detection handling error (cam={camera_id}): {e}")

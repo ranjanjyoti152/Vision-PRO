@@ -90,14 +90,18 @@ class DeepStreamBridge:
         camera_id: str,
         detections: list,
         jpeg: Optional[bytes] = None,
+        frame_width: int = 1920,
+        frame_height: int = 1080,
     ) -> None:
         """Send detection metadata (+ optional snapshot jpeg) to FastAPI."""
         msg = {
-            "type":       "detection",
-            "camera_id":  camera_id,
-            "timestamp":  time.time(),
-            "detections": detections,
-            "jpeg":       jpeg,
+            "type":         "detection",
+            "camera_id":    camera_id,
+            "timestamp":    time.time(),
+            "detections":   detections,
+            "jpeg":         jpeg,
+            "frame_width":  frame_width,
+            "frame_height": frame_height,
         }
         try:
             self._sock.send(msgpack.packb(msg, use_bin_type=True), zmq.NOBLOCK)

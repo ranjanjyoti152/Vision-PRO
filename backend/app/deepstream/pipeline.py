@@ -296,7 +296,8 @@ def osd_sink_pad_buffer_probe(pad, info, camera_id):
 
         if detections and bridge:
             jpeg = _latest_jpeg.get(camera_id)
-            bridge.publish_detections(camera_id, detections, jpeg=jpeg)
+            bridge.publish_detections(camera_id, detections, jpeg=jpeg,
+                                     frame_width=img_w, frame_height=img_h)
 
         try:
             l_frame = l_frame.next
