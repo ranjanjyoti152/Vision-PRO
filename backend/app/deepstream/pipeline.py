@@ -310,32 +310,24 @@ def osd_sink_pad_buffer_probe(pad, info, camera_id):
 # ─── appsink callback — JPEG frames ─────────────────────────────────────────
 
 def on_new_sample(appsink, camera_id: str):
-    """Capture frame from appsink, encode to JPEG, send to FastAPI."""
+    """Capture pre-encoded JPEG frame from appsink and send to FastAPI."""
     sample = appsink.emit("pull-sample")
     if not sample:
         return Gst.FlowReturn.ERROR
 
     buf = sample.get_buffer()
-    caps = sample.get_caps()
-    struct = caps.get_structure(0)
-    width  = struct.get_value("width")
-    height = struct.get_value("height")
-
     success, map_info = buf.map(Gst.MapFlags.READ)
     if not success:
         return Gst.FlowReturn.ERROR
 
     try:
-        arr = np.frombuffer(map_info.data, dtype=np.uint8).reshape((height, width, 3))
-        img = Image.fromarray(arr, "RGB")
-        buf_io = io.BytesIO()
-        img.save(buf_io, format="JPEG", quality=JPEG_QUALITY)
-        jpeg = buf_io.getvalue()
+        # buf already contains the JPEG payload from nvjpegenc
+        jpeg = bytes(map_info.data)
         _latest_jpeg[camera_id] = jpeg  # cache for detection snapshots
         if bridge:
             bridge.publish_frame(camera_id, jpeg)
     except Exception as e:
-        logger.warning(f"Frame encode error: {e}")
+        logger.warning(f"Frame publish error: {e}")
     finally:
         buf.unmap(map_info)
 
@@ -381,11 +373,13 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     infer    = make("nvinfer",        f"nvinfer_{safe_id}")
     fakesink = make("fakesink",       f"fsink_{safe_id}")
 
-    # Branch 2 — JPEG for WebSocket
+    # Branch 2 — JPEG for WebSocket (Hardware Accelerated)
     queue2   = make("queue",          f"q_jpeg_{safe_id}")
     conv2    = make("nvvideoconvert", f"conv_jpeg_{safe_id}")
     caps2    = make("capsfilter",     f"caps2_{safe_id}")
-    caps2.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGB"))
+    caps2.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=I420"))
+    jpegenc  = make("nvjpegenc",      f"jpegenc_{safe_id}")
+    jpegenc.set_property("quality", JPEG_QUALITY)
     appsink  = make("appsink",        f"appsink_{safe_id}")
 
     # Set compute-hw=1 (GPU) on all nvvideoconvert elements
@@ -397,7 +391,7 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     src.set_property("location", rtsp_url)
     src.set_property("protocols", 4)   # TCP=4
     src.set_property("latency", 200)
-    src.set_property("drop-on-latency", True)
+    src.set_property("drop-on-latency", False)
     src.set_property("buffer-mode", 0)
 
     infer.set_property("config-file-path", nvinfer_config)
@@ -415,7 +409,7 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     # Add all to pipeline
     for el in [src, depay, parse, decoder, conv1, caps1, tee,
                queue1, streammux, infer, fakesink,
-               queue2, conv2, caps2, appsink]:
+               queue2, conv2, caps2, jpegenc, appsink]:
         pipeline.add(el)
 
     # Handle dynamic rtspsrc → depay pad
@@ -454,7 +448,8 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     tee_src2.link(queue2_sink)
     queue2.link(conv2)
     conv2.link(caps2)
-    caps2.link(appsink)
+    caps2.link(jpegenc)
+    jpegenc.link(appsink)
 
     # Add pad probe on nvinfer src pad for raw tensor detection metadata
     infer_src = infer.get_static_pad("src")

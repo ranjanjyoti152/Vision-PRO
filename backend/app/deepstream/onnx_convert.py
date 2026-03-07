@@ -29,7 +29,7 @@ def convert_pt_to_onnx(
     onnx_path: str = DEFAULT_ONNX,
     imgsz: int = 640,
     opset: int = 12,
-    simplify: bool = True,
+    simplify: bool = False,
 ) -> str:
     """
     Convert a YOLO .pt model to ONNX format.
@@ -44,6 +44,13 @@ def convert_pt_to_onnx(
     Returns:
         Path to the generated .onnx file.
     """
+    # FORCE CLEANUP of potentially corrupted ONNX files from previous crashes
+    if os.path.exists(onnx_path):
+        os.remove(onnx_path)
+    default_out = pt_path.replace(".pt", ".onnx")
+    if os.path.exists(default_out):
+        os.remove(default_out)
+
     if os.path.exists(onnx_path):
         logger.info(f"✅ ONNX model already exists: {onnx_path}")
         return onnx_path
@@ -53,7 +60,7 @@ def convert_pt_to_onnx(
         logger.info(f"📥 Downloading model weights: {pt_path}")
         from ultralytics import YOLO
         model_name = Path(pt_path).stem  # e.g. "yolov8n"
-        YOLO(model_name)  # triggers auto-download
+        YOLO(f"{model_name}.pt")  # triggers auto-download
         downloaded = f"{model_name}.pt"
         if os.path.exists(downloaded):
             os.makedirs(os.path.dirname(pt_path), exist_ok=True)
