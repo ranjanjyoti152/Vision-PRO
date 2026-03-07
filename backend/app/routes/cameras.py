@@ -13,28 +13,8 @@ from app.core.websocket import ws_manager
 from app.models.camera import CameraCreate, CameraUpdate, CameraResponse
 from app.config import settings
 
-import docker
 import logging
-import threading
 logger = logging.getLogger(__name__)
-
-def _restart_deepstream_container():
-    """Restart the DeepStream container in a background thread (non-blocking)."""
-    if not settings.DEEPSTREAM_ENABLED:
-        return
-    container_name = getattr(settings, "DEEPSTREAM_CONTAINER_NAME", "visionpro-deepstream-jetson")
-
-    def _do_restart():
-        try:
-            client = docker.from_env()
-            container = client.containers.get(container_name)
-            logger.info(f"🔄 Restarting {container_name} to apply camera changes...")
-            container.restart()
-            logger.info(f"✅ {container_name} restarted successfully")
-        except Exception as e:
-            logger.error(f"Failed to restart {container_name}: {e}")
-
-    threading.Thread(target=_do_restart, daemon=True).start()
 
 router = APIRouter(prefix="/api/cameras", tags=["Cameras"])
 
@@ -98,21 +78,13 @@ async def create_camera(
     cam_doc["_id"] = result.inserted_id
     cam_id = str(result.inserted_id)
 
-    if settings.DEEPSTREAM_ENABLED:
-        if camera.enabled:
-            # Start an immediate OpenCV fallback stream for instant video
-            fps = min(camera.fps, settings.STREAM_MAX_FPS)
-            stream_manager.start_stream(cam_id, camera.rtsp_url, fps)
-            # Restart DeepStream in background (non-blocking) to pick up new camera
-            _restart_deepstream_container()
-    else:
-        # Auto-start stream if enabled (Standard OpenCV mode)
-        if camera.enabled:
-            fps = min(camera.fps, settings.STREAM_MAX_FPS)
-            stream_manager.start_stream(cam_id, camera.rtsp_url, fps)
-            await cameras_collection().update_one(
-                {"_id": result.inserted_id}, {"$set": {"status": "connecting"}}
-            )
+    # Auto-start stream if enabled
+    if camera.enabled:
+        fps = min(camera.fps, settings.STREAM_MAX_FPS)
+        stream_manager.start_stream(cam_id, camera.rtsp_url, fps)
+        await cameras_collection().update_one(
+            {"_id": result.inserted_id}, {"$set": {"status": "connecting"}}
+        )
 
     return _cam_doc_to_response(cam_doc)
 
@@ -151,23 +123,18 @@ async def update_camera(
     if not result:
         raise HTTPException(status_code=404, detail="Camera not found")
 
-    if settings.DEEPSTREAM_ENABLED:
-        # For any stream-affecting change, restart the DeepStream container
-        if "rtsp_url" in update_dict or "fps" in update_dict or "enabled" in update_dict:
-            _restart_deepstream_container()
-    else:
-        # If RTSP URL or FPS changed, restart the stream (Standard OpenCV mode)
-        if "rtsp_url" in update_dict or "fps" in update_dict:
-            fps = min(result.get("fps", 25), settings.STREAM_MAX_FPS)
-            await stream_manager.restart_stream(camera_id, result["rtsp_url"], fps)
+    # If RTSP URL or FPS changed, restart the stream
+    if "rtsp_url" in update_dict or "fps" in update_dict:
+        fps = min(result.get("fps", 25), settings.STREAM_MAX_FPS)
+        await stream_manager.restart_stream(camera_id, result["rtsp_url"], fps)
 
-        # If toggled enabled/disabled
-        if "enabled" in update_dict:
-            if update_dict["enabled"]:
-                fps = min(result.get("fps", 25), settings.STREAM_MAX_FPS)
-                stream_manager.start_stream(camera_id, result["rtsp_url"], fps)
-            else:
-                await stream_manager.stop_stream(camera_id)
+    # If toggled enabled/disabled
+    if "enabled" in update_dict:
+        if update_dict["enabled"]:
+            fps = min(result.get("fps", 25), settings.STREAM_MAX_FPS)
+            stream_manager.start_stream(camera_id, result["rtsp_url"], fps)
+        else:
+            await stream_manager.stop_stream(camera_id)
 
     return _cam_doc_to_response(result)
 
@@ -177,10 +144,7 @@ async def delete_camera(camera_id: str, admin: dict = Depends(require_admin)):
     """Remove a camera and stop its stream (admin only)."""
     from app.services.stream_manager import stream_manager
 
-    if settings.DEEPSTREAM_ENABLED:
-        _restart_deepstream_container()
-    else:
-        await stream_manager.stop_stream(camera_id)
+    await stream_manager.stop_stream(camera_id)
 
     result = await cameras_collection().delete_one({"_id": ObjectId(camera_id)})
     if result.deleted_count == 0:

@@ -14,9 +14,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-# Force OpenCV FFmpeg backend to use TCP for RTSP to prevent UDP packet loss (macroblock corruption)
+# Force OpenCV FFmpeg backend to use TCP for RTSP and enable NVIDIA hardware decoding
 # Also suppress verbose FFmpeg stderr output (macroblock warnings, chroma pred errors etc.)
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|loglevel;quiet"
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda|rtsp_transport;tcp|loglevel;quiet")
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 
 import cv2
