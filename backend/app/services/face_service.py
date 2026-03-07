@@ -33,10 +33,7 @@ class FaceEngine:
 
     def load(self):
         """Load InsightFace models into GPU/CPU."""
-        import platform
-        if platform.machine() == 'aarch64':
-            logger.warning("⚠️ Face recognition disabled on aarch64/Jetson (onnxruntime incompatible)")
-            return
+        # Removed the aarch64 block because we manually installed onnxruntime-gpu
         if not INSIGHTFACE_AVAILABLE:
             logger.warning("⚠️ InsightFace not available — face recognition disabled")
             return
