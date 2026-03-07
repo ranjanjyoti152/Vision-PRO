@@ -14,9 +14,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-# Force OpenCV FFmpeg backend to use TCP for RTSP and enable NVIDIA hardware decoding
-# Also suppress verbose FFmpeg stderr output (macroblock warnings, chroma pred errors etc.)
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "hwaccel;cuda|rtsp_transport;tcp|loglevel;quiet")
+# Force OpenCV FFmpeg backend to use TCP for RTSP and enable NVIDIA hardware decoding if available
+# The env var can be overridden via docker-compose to add hwaccel;cuda when FFmpeg is compiled with NVIDIA
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|loglevel;quiet")
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 
 import cv2
@@ -158,10 +158,7 @@ class CameraStream:
         self._release_capture()
 
         def _open():
-            # Suppress noisy ffmpeg decode warnings & force TCP for RTSP
-            import os
-            os.environ.setdefault('OPENCV_FFMPEG_LOGLEVEL', '-8')  # AV_LOG_QUIET
-            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+            # FFmpeg options are already set at module level (line 19)
 
             cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
             # Use TCP transport to avoid UDP packet loss causing h264 decode errors

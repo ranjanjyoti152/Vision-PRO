@@ -22,11 +22,12 @@ qdrant-client==1.11.3  # 1.12+ has grpc type syntax incompatible with NVIDIA con
 
 # AI / ML (Jetson-compatible)
 ultralytics>=8.3.0
-# opencv-python-headless — pre-installed with CUDA in NVIDIA container, do NOT reinstall
-# numpy — pre-installed in NVIDIA container
-# torch — pre-installed with CUDA in NVIDIA container, do NOT reinstall
+opencv-python-headless>=4.10.0
+numpy>=1.26.0,<2.0.0
+# torch — install separately with CUDA from NVIDIA index
 insightface>=0.7.3
-onnxruntime==1.19.2  # 1.24.x crashes on aarch64 Jetson
+# onnxruntime-gpu — install the wheel manually from Jetson Zoo
+# onnxruntime==1.19.2
 
 # Image Processing
 Pillow>=10.0.0
