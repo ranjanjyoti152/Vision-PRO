@@ -59,12 +59,58 @@ class LLMService:
                         {"_id": event_oid}, {"$set": {"ai_summary": ai_summary}}
                     )
                     logger.info(f"✅ AI summary saved for event {event_oid}: {ai_summary[:80]}")
+
+                    # Embed the event into Qdrant with the AI-generated summary
+                    await self._embed_event(event_oid, ai_summary, job)
                 else:
                     logger.warning(f"⚠️ LLM returned empty/fallback summary for event {event_oid}")
+                    # Still embed with whatever we have
+                    await self._embed_event(event_oid, None, job)
             except Exception as e:
                 logger.warning(f"❌ Summary queue job failed for event {job.get('event_oid', '?')}: {e}")
             finally:
                 self._queue.task_done()
+
+    async def _embed_event(self, event_oid, ai_summary: str | None, job: dict):
+        """Embed a completed event into Qdrant for semantic search."""
+        try:
+            from app.database import events_collection, cameras_collection
+            from app.vector_db import build_event_text, upsert_event_embedding
+
+            event_doc = await events_collection().find_one({"_id": event_oid})
+            if not event_doc:
+                return
+
+            # Resolve camera name
+            camera_name = ""
+            cam_id = event_doc.get("camera_id", "")
+            if cam_id:
+                from bson import ObjectId
+                cam_doc = await cameras_collection().find_one({"_id": ObjectId(cam_id)}) if ObjectId.is_valid(cam_id) else None
+                if cam_doc:
+                    camera_name = cam_doc.get("name", cam_id)
+
+            text = build_event_text(event_doc, camera_name)
+
+            # Metadata stored alongside the vector
+            metadata = {
+                "event_type": event_doc.get("event_type", ""),
+                "camera_id": cam_id,
+                "camera_name": camera_name,
+                "confidence": event_doc.get("confidence", 0),
+                "timestamp": event_doc.get("timestamp", "").isoformat() if event_doc.get("timestamp") else "",
+                "ai_summary": event_doc.get("ai_summary", ""),
+                "snapshot_path": event_doc.get("snapshot_path", ""),
+                "detected_objects": [obj.get("class", obj.get("className", "")) for obj in event_doc.get("detected_objects", [])],
+            }
+
+            # Use a hex string of the ObjectId as the Qdrant point ID
+            point_id = str(event_oid)
+            ok = await upsert_event_embedding(point_id, text, metadata)
+            if ok:
+                logger.info(f"📌 Event {event_oid} embedded in Qdrant")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to embed event {event_oid}: {e}")
 
     def enqueue_summary(self, event_oid, event_type, confidence, objects, face_name=None, snapshot_path=None):
         """Add a summary job to the queue. Drops silently if queue is full."""

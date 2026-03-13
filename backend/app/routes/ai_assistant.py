@@ -1,13 +1,15 @@
 """
-AI Assistant routes – Chat with RAG (event context injection).
+AI Assistant routes – Chat with RAG (event context injection + semantic search).
 """
 import json
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from app.core.security import get_current_user
 from app.services.llm_service import llm_service
-from app.database import events_collection, cameras_collection, chat_history_collection
+from app.database import events_collection, cameras_collection, chat_history_collection, settings_collection
+from app.vector_db import search_similar_events
 from app.config import settings
 import re
 import logging
@@ -19,23 +21,61 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/assistant", tags=["AI Assistant"])
 
 
+async def _get_display_tz() -> ZoneInfo:
+    """Get the user's display timezone from DB settings."""
+    try:
+        doc = await settings_collection().find_one({"key": "display_timezone"})
+        if doc and doc.get("value"):
+            return ZoneInfo(doc["value"])
+    except Exception:
+        pass
+    return ZoneInfo("Asia/Kolkata")
+
+
+def _to_local(dt: datetime, tz: ZoneInfo) -> datetime:
+    """Convert a UTC (or naive) datetime to the local timezone."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz)
+
+
 async def _fetch_event_context(user_msg: str, base_url: str) -> dict:
     """Fetch relevant events from MongoDB based on the user's question."""
     now = datetime.now(timezone.utc)
+    local_tz = await _get_display_tz()
     msg_lower = user_msg.lower()
 
     # Determine time range from the query
-    if any(w in msg_lower for w in ["today", "today's", "this morning", "this afternoon"]):
+    start = None
+    end = now
+    time_label = "last 24 hours"
+
+    # Check for relative time expressions first ("20 minutes ago", "3 hours ago", etc.)
+    rel_match = re.search(r'(\d+)\s*(min(?:ute)?s?|hours?|hrs?|days?)\s*ago', msg_lower)
+    if rel_match:
+        amount = int(rel_match.group(1))
+        unit = rel_match.group(2)
+        if unit.startswith("min"):
+            delta = timedelta(minutes=max(amount * 2, 30))  # widen window around the mentioned time
+            time_label = f"last {amount * 2} minutes"
+        elif unit.startswith("h"):
+            delta = timedelta(hours=max(amount * 2, 2))
+            time_label = f"last {amount * 2} hours"
+        else:
+            delta = timedelta(days=amount + 1)
+            time_label = f"last {amount + 1} days"
+        start = now - delta
+    elif any(w in msg_lower for w in ["today", "today's", "this morning", "this afternoon"]):
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = now
         time_label = "today"
-    elif any(w in msg_lower for w in ["last hour", "past hour", "recent"]):
+    elif any(w in msg_lower for w in ["last hour", "past hour"]):
         start = now - timedelta(hours=1)
-        end = now
         time_label = "last hour"
+    elif any(w in msg_lower for w in ["recently", "recent", "lately"]):
+        start = now - timedelta(hours=6)
+        time_label = "last 6 hours"
     elif any(w in msg_lower for w in ["last 24 hours", "past 24"]):
         start = now - timedelta(hours=24)
-        end = now
         time_label = "last 24 hours"
     elif any(w in msg_lower for w in ["yesterday"]):
         start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -43,16 +83,13 @@ async def _fetch_event_context(user_msg: str, base_url: str) -> dict:
         time_label = "yesterday"
     elif any(w in msg_lower for w in ["this week", "past week", "last 7 days"]):
         start = now - timedelta(days=7)
-        end = now
         time_label = "this week"
     elif any(w in msg_lower for w in ["this month", "past month"]):
         start = now - timedelta(days=30)
-        end = now
         time_label = "this month"
-    else:
-        # Default: last 24 hours
+
+    if start is None:
         start = now - timedelta(hours=24)
-        end = now
         time_label = "last 24 hours"
 
     # Build MongoDB query
@@ -90,7 +127,8 @@ async def _fetch_event_context(user_msg: str, base_url: str) -> dict:
 
         ts = evt.get("timestamp")
         if ts:
-            hour_key = ts.strftime("%H:00")
+            local_ts = _to_local(ts, local_tz)
+            hour_key = local_ts.strftime("%H:00")
             hourly_counts[hour_key] = hourly_counts.get(hour_key, 0) + 1
 
     # Get camera names (resolve before building recent_events)
@@ -110,7 +148,7 @@ async def _fetch_event_context(user_msg: str, base_url: str) -> dict:
         snapshot_url = f"{base_url}{snapshot}" if snapshot else ""
         cam_id = evt.get("camera_id", "")
         recent_events.append({
-            "time": evt.get("timestamp", "").strftime("%Y-%m-%d %H:%M:%S") if evt.get("timestamp") else "",
+            "time": _to_local(evt["timestamp"], local_tz).strftime("%Y-%m-%d %H:%M:%S") if evt.get("timestamp") else "",
             "type": evt.get("event_type", ""),
             "confidence": round(evt.get("confidence", 0), 2),
             "camera": camera_names.get(cam_id, cam_id),
@@ -125,40 +163,84 @@ async def _fetch_event_context(user_msg: str, base_url: str) -> dict:
         name = camera_names.get(cam_id, cam_id)
         camera_stats[name] = count
 
+    # Semantic search: find events most relevant to the user's message
+    semantic_results = []
+    try:
+        hits = await search_similar_events(user_msg, limit=10)
+        for hit in hits:
+            snapshot = hit.get("snapshot_path", "")
+            snapshot_url = f"{base_url}{snapshot}" if snapshot else ""
+            # Convert semantic hit timestamp string to local time
+            sem_time = hit.get("timestamp", "")
+            if sem_time and isinstance(sem_time, str):
+                try:
+                    sem_dt = datetime.fromisoformat(sem_time)
+                    sem_time = _to_local(sem_dt, local_tz).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
+            semantic_results.append({
+                "score": round(hit.get("score", 0), 3),
+                "type": hit.get("event_type", ""),
+                "time": sem_time,
+                "confidence": round(hit.get("confidence", 0), 2),
+                "camera": hit.get("camera_name", hit.get("camera_id", "")),
+                "summary": hit.get("ai_summary", ""),
+                "snapshot_url": snapshot_url,
+                "objects": hit.get("detected_objects", []),
+            })
+    except Exception as e:
+        logger.warning(f"Semantic search failed: {e}")
+
+    now_local = _to_local(now, local_tz)
+
     return {
         "time_range": time_label,
+        "current_local_time": now_local.strftime("%Y-%m-%d %I:%M %p"),
         "total_events": total_count,
         "fetched_events": len(events),
         "type_breakdown": type_counts,
         "camera_breakdown": camera_stats,
         "hourly_distribution": dict(sorted(hourly_counts.items())),
         "recent_events": recent_events,
+        "semantic_matches": semantic_results,
     }
 
 
 def _build_system_prompt(context: dict) -> str:
     """Build a system prompt with event context data."""
     lines = [
-        "You are a friendly, conversational AI security assistant named 'Vision AI' for Vision Pro NVR.",
-        "Personality: You're like a helpful colleague who monitors the cameras. Be warm, casual, and natural.",
-        "- Use conversational language, not corporate/robotic tone",
-        "- Use emojis sparingly but naturally (🚗 👤 🐱 📷 ✅ ⚠️)",
-        "- Be concise — short paragraphs, not walls of text",
-        "- When asked 'how are you', reply naturally like a person would",
-        "- Greet casually, use phrases like 'Looks like...', 'Here's what I found...', 'Quick update...'",
-        "- For simple questions, give short direct answers. Only add detail when asked",
-        "- Use markdown **bold** for key numbers and findings",
+        "You are 'Vision AI' — a chill, street-smart security buddy who watches the cameras for the user.",
+        "Think of yourself as the user's friend who's always got eyes on things. You're casual, witty, and observant.",
         "",
-        "CRITICAL INSTRUCTIONS FOR DATA ACCURACY:",
-        "1. NEVER invent or guess names (like 'John Doe', 'Jane Smith') unless they are explicitly in the 'summary' field.",
-        "2. NEVER invent events, times, or cameras that are not in the 'Data' section below.",
-        "3. If a user asks about something not in the data, explicitly state that you don't have that information in the recent database events.",
-        "4. Stick STRICTLY to the facts provided in the context.",
+        "## YOUR PERSONALITY:",
+        "- Talk like a real person texting a friend, NOT a corporate bot",
+        "- Use casual language: 'bro', 'yo', 'lol', 'ngl', 'my bad', 'gotchu', 'heads up'",
+        "- Be blunt and specific: 'She walked in at 7:12 PM, opened the fridge first thing, stood there for a bit'",
+        "- Keep it SHORT. One-liners when possible. No walls of text",
+        "- Use emojis naturally but don't overdo it",
+        "- When greeted ('hi', 'hey', 'bro'), reply casually: 'Yo what's up!', 'Yeah I'm here lol. What's up?'",
+        "- Have opinions: 'That's kinda sus ngl', 'All good, nothing weird'",
+        "- Be proactive: suggest things like 'Want me to keep an eye on that?', 'I can set up alerts for this'",
+        "- For weekly/daily reports: narrate like you're telling a story, not listing data",
+        "- Describe what you see in snapshots like a friend would: 'Looks like someone left the gate open again'",
+        "- Use **bold** for important stuff",
         "",
-        "You CAN display event snapshots! When asked, use: ![description](snapshot_url)",
-        "Snapshot/video URLs are in the event data below.",
+        "## RESPONSE STYLE EXAMPLES:",
+        "- User: 'what happened today?' → 'Pretty quiet day tbh. **12 events** total — mostly just people walking by the front gate. One car pulled up around 3 PM but left after a few mins. Nothing sketchy 👍'",
+        "- User: 'any vehicles?' → 'Yeah, **3 vehicles** spotted. Two at the front gate, one in the backyard cam around 5 PM. Want me to pull up the snapshots?'",
+        "- User: 'hi' → 'Hey! 👋 What's good? Everything's been chill on the cameras today'",
+        "- User: 'weekly report pls' → 'Alright here's your week in review: **45 events** total. Monday was the busiest — 12 hits mostly on the front gate...'",
         "",
-        f"## Data ({context['time_range']}): {context['total_events']} events",
+        "## RULES:",
+        "1. NEVER make up names, events, times, or cameras that aren't in the data below",
+        "2. If you don't have info, say so casually: 'Hmm I don't have anything on that in the recent logs'",
+        "3. Stick STRICTLY to facts from the data — but present them in your casual style",
+        "4. You CAN show event snapshots: use ![description](snapshot_url)",
+        "5. When describing events, tell it like a story — times, actions, cameras, what happened",
+        "6. All times shown are in the user's LOCAL timezone. Use 12-hour format (e.g., 2:30 PM) when talking to the user.",
+        "",
+        f"## CURRENT TIME: {context.get('current_local_time', 'unknown')}",
+        f"## DATA ({context['time_range']}): {context['total_events']} events",
         f"- **Total events:** {context['total_events']}",
         f"- **Events analyzed:** {context['fetched_events']}",
         "",
@@ -188,6 +270,21 @@ def _build_system_prompt(context: dict) -> str:
             lines.append(
                 f"- [{evt['time']}] {evt['type']} (conf: {evt['confidence']}) "
                 f"on camera {evt['camera']}: {evt['summary']}{snapshot_info}{video_info}"
+            )
+
+    if context.get("semantic_matches"):
+        lines.append("")
+        lines.append("### Semantically Relevant Events (AI-matched to the user's question):")
+        if context.get("total_events", 0) == 0:
+            lines.append("**IMPORTANT**: The time-based query returned 0 events, but these semantic matches were found. USE THESE to answer the user — mention when they happened even if outside the time window.")
+        else:
+            lines.append("These events were found by semantic similarity to the user's query. Use these for detailed, specific answers.")
+        for evt in context["semantic_matches"]:
+            snapshot_info = f" | Snapshot: {evt['snapshot_url']}" if evt.get('snapshot_url') else ""
+            obj_info = f" | Objects: {', '.join(evt['objects'])}" if evt.get('objects') else ""
+            lines.append(
+                f"- [{evt['time']}] {evt['type']} (conf: {evt['confidence']}, relevance: {evt['score']}) "
+                f"on camera {evt['camera']}: {evt['summary']}{obj_info}{snapshot_info}"
             )
 
     return "\n".join(lines)
@@ -269,10 +366,23 @@ async def chat_stream(
 
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_msg},
     ]
 
     user_id = str(user.get("_id", ""))
+
+    # Include recent chat history for conversational continuity
+    try:
+        history_cursor = chat_history_collection().find(
+            {"user_id": user_id}
+        ).sort("timestamp", -1).limit(10)
+        history_msgs = await history_cursor.to_list(length=10)
+        history_msgs.reverse()  # oldest first
+        for h in history_msgs:
+            messages.append({"role": h["role"], "content": h["content"]})
+    except Exception as e:
+        logger.debug(f"Could not load chat history: {e}")
+
+    messages.append({"role": "user", "content": user_msg})
 
     async def event_generator():
         # Send context metadata first
