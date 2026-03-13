@@ -6,7 +6,7 @@ import {
 } from '@mui/material';
 import {
     SmartToy, Delete, Upload, Refresh,
-    CheckCircle, CloudDownload, Memory, Speed, Star,
+    CheckCircle, CloudDownload, Memory, Speed, Star, JoinInner,
 } from '@mui/icons-material';
 import { modelsApi } from '../services/api';
 
@@ -44,6 +44,14 @@ const AIModels: React.FC = () => {
     const [uploadOpen, setUploadOpen] = useState(false);
     const [uploadFile, setUploadFile] = useState<File | null>(null);
     const [uploadName, setUploadName] = useState('');
+
+    // Merge Dialog
+    const [mergeOpen, setMergeOpen] = useState(false);
+    const [mergeName, setMergeName] = useState('');
+    const [mergeSelection, setMergeSelection] = useState<string[]>([]);
+    const [mergeClassSelection, setMergeClassSelection] = useState<Record<string, string[]>>({});
+    const [expandedModel, setExpandedModel] = useState<string | null>(null);
+    const [merging, setMerging] = useState(false);
 
     // Snackbar
     const [snack, setSnack] = useState<{ open: boolean; message: string; severity: 'success' | 'error' | 'info' }>({ open: false, message: '', severity: 'info' });
@@ -179,6 +187,23 @@ const AIModels: React.FC = () => {
         setUploading(false);
     };
 
+    const handleMerge = async () => {
+        if (!mergeName.trim() || mergeSelection.length < 2) return;
+        setMerging(true);
+        try {
+            await modelsApi.merge(mergeName.trim(), mergeSelection, mergeClassSelection);
+            showSnack(`Merged model ${mergeName} created successfully`);
+            setMergeOpen(false);
+            setMergeName('');
+            setMergeSelection([]);
+            setMergeClassSelection({});
+            fetchData();
+        } catch (e: any) {
+            showSnack(e.response?.data?.detail || 'Merge failed', 'error');
+        }
+        setMerging(false);
+    };
+
     const handleReloadDeepstream = async () => {
         try {
             const res = await modelsApi.reloadDeepstream();
@@ -225,6 +250,10 @@ const AIModels: React.FC = () => {
                     <Button startIcon={<Refresh />} variant="outlined" size="small" onClick={handleReloadDeepstream}
                         sx={{ borderRadius: 2, textTransform: 'none' }}>
                         Reload DeepStream
+                    </Button>
+                    <Button startIcon={<JoinInner />} variant="outlined" size="small" onClick={() => setMergeOpen(true)}
+                        sx={{ borderRadius: 2, textTransform: 'none' }}>
+                        Merge Models
                     </Button>
                     <Button startIcon={<Upload />} variant="contained" size="small" onClick={() => setUploadOpen(true)}
                         sx={{ borderRadius: 2, textTransform: 'none' }}>
@@ -393,11 +422,20 @@ const AIModels: React.FC = () => {
                                                             sx={{ height: 20, fontSize: 10, background: 'rgba(255,255,255,0.06)' }} />
                                                         <Chip label={formatSize(m.file_size_bytes)} size="small"
                                                             sx={{ height: 20, fontSize: 10, background: 'rgba(255,255,255,0.06)' }} />
-                                                        {m.is_custom && (
+                                                        {m.is_custom && m.type !== 'merged' && (
                                                             <Chip label="Custom" size="small"
                                                                 sx={{ height: 20, fontSize: 10, fontWeight: 600, background: 'rgba(124,77,255,0.15)', color: '#7C4DFF' }} />
                                                         )}
+                                                        {m.type === 'merged' && (
+                                                            <Chip icon={<JoinInner sx={{ fontSize: 12 }} />} label="Merged" size="small"
+                                                                sx={{ height: 20, fontSize: 10, fontWeight: 600, background: 'rgba(255,152,0,0.15)', color: '#FF9800', pl: 0.5 }} />
+                                                        )}
                                                     </Stack>
+                                                    {m.type === 'merged' && m.metadata?.merged_models && (
+                                                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1, fontSize: '0.65rem' }}>
+                                                            Includes: {m.metadata.merged_models.map((mm: any) => mm.name).join(' + ')}
+                                                        </Typography>
+                                                    )}
                                                 </Box>
 
                                                 {/* Active/Default indicators */}
@@ -590,6 +628,138 @@ const AIModels: React.FC = () => {
                         startIcon={uploading ? <CircularProgress size={14} /> : <Upload />}
                         sx={{ borderRadius: 2, textTransform: 'none' }}>
                         {uploading ? 'Uploading...' : 'Upload'}
+                    </Button>
+                </DialogActions>
+            </Dialog>
+
+            {/* ── Merge Models Dialog ─────────────────────────────── */}
+            <Dialog open={mergeOpen} onClose={() => !merging && setMergeOpen(false)} maxWidth="sm" fullWidth
+                PaperProps={{ sx: { background: '#0f1419', borderRadius: 3, border: '1px solid rgba(148,163,184,0.08)' } }}>
+                <DialogTitle sx={{ fontWeight: 700 }}>Merge Multiple Models</DialogTitle>
+                <DialogContent>
+                    <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                        Combine multiple trained models to detect all of their classes concurrently on the same video streams.
+                    </Typography>
+                    <TextField fullWidth label="Merged Model Name" value={mergeName}
+                        onChange={e => setMergeName(e.target.value)}
+                        placeholder="e.g. combined_person_vehicle_animals"
+                        size="small" sx={{ mb: 3 }} />
+
+                    <Typography variant="subtitle2" sx={{ mb: 1.5, fontWeight: 600 }}>Select Models to Include</Typography>
+
+                    <Box sx={{ border: '1px solid rgba(148,163,184,0.1)', borderRadius: 2, maxHeight: 400, overflow: 'auto' }}>
+                        {models.filter(m => (m.metadata?.status === 'ready' || !m.metadata?.status) && m.type !== 'merged').map(m => {
+                            const isSelected = mergeSelection.includes(m.id);
+                            const isExpanded = expandedModel === m.id;
+                            const classes: string[] = m.metadata?.classes || [];
+                            const activeClasses = mergeClassSelection[m.id] || [];
+
+                            return (
+                                <Box key={m.id} sx={{ borderBottom: '1px solid rgba(148,163,184,0.1)' }}>
+                                    <Box sx={{
+                                        p: 1.5,
+                                        display: 'flex', alignItems: 'center', cursor: 'pointer',
+                                        '&:hover': { background: 'rgba(255,255,255,0.02)' }
+                                    }} onClick={() => {
+                                        setMergeSelection(prev => {
+                                            if (prev.includes(m.id)) {
+                                                const next = prev.filter(id => id !== m.id);
+                                                setMergeClassSelection(c => { const n = { ...c }; delete n[m.id]; return n; });
+                                                return next;
+                                            } else {
+                                                setMergeClassSelection(c => ({ ...c, [m.id]: classes }));
+                                                setExpandedModel(m.id);
+                                                return [...prev, m.id];
+                                            }
+                                        });
+                                    }}>
+                                        <Box sx={{
+                                            width: 20, height: 20, borderRadius: 1, border: '1px solid rgba(148,163,184,0.5)',
+                                            mr: 2, display: 'flex', alignItems: 'center', justifyContent: 'center',
+                                            background: isSelected ? '#4F8EF7' : 'transparent',
+                                            borderColor: isSelected ? '#4F8EF7' : 'rgba(148,163,184,0.5)'
+                                        }}>
+                                            {isSelected && <CheckCircle sx={{ fontSize: 16, color: '#fff' }} />}
+                                        </Box>
+                                        <Box sx={{ flexGrow: 1 }}>
+                                            <Typography variant="body2" sx={{ fontWeight: 600 }}>{m.name}</Typography>
+                                            <Typography variant="caption" color="text.secondary">
+                                                V{m.version} • {classes.length} classes
+                                                {isSelected && ` • ${activeClasses.length} selected`}
+                                            </Typography>
+                                        </Box>
+                                        {isSelected && classes.length > 0 && (
+                                            <Button size="small" variant="text"
+                                                onClick={(e) => { e.stopPropagation(); setExpandedModel(isExpanded ? null : m.id); }}
+                                                sx={{ minWidth: 0, textTransform: 'none', fontSize: '0.7rem' }}>
+                                                {isExpanded ? 'Hide Classes' : 'Edit Classes'}
+                                            </Button>
+                                        )}
+                                    </Box>
+
+                                    {isSelected && isExpanded && classes.length > 0 && (
+                                        <Box sx={{ p: 2, pt: 0, background: 'rgba(0,0,0,0.1)' }}>
+                                            <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 1, mt: 1 }}>
+                                                <Typography variant="caption" sx={{ fontWeight: 600, color: 'text.secondary' }}>
+                                                    Select classes to detect:
+                                                </Typography>
+                                                <Button size="small" sx={{ fontSize: '0.65rem', minWidth: 0, p: 0 }}
+                                                    onClick={() => {
+                                                        setMergeClassSelection(prev => ({
+                                                            ...prev,
+                                                            [m.id]: activeClasses.length === classes.length ? [] : classes
+                                                        }));
+                                                    }}>
+                                                    {activeClasses.length === classes.length ? 'Deselect All' : 'Select All'}
+                                                </Button>
+                                            </Stack>
+                                            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5 }}>
+                                                {classes.map(c => {
+                                                    const isClassActive = activeClasses.includes(c);
+                                                    return (
+                                                        <Chip
+                                                            key={c}
+                                                            label={c}
+                                                            size="small"
+                                                            onClick={() => {
+                                                                setMergeClassSelection(prev => {
+                                                                    const current = prev[m.id] || [];
+                                                                    return {
+                                                                        ...prev,
+                                                                        [m.id]: isClassActive ? current.filter(x => x !== c) : [...current, c]
+                                                                    };
+                                                                });
+                                                            }}
+                                                            sx={{
+                                                                height: 20,
+                                                                fontSize: 10,
+                                                                cursor: 'pointer',
+                                                                transition: 'all 0.1s',
+                                                                background: isClassActive ? 'rgba(79,142,247,0.15)' : 'rgba(255,255,255,0.03)',
+                                                                color: isClassActive ? '#4F8EF7' : 'text.disabled',
+                                                                border: isClassActive ? '1px solid rgba(79,142,247,0.3)' : '1px solid transparent',
+                                                                '&:hover': { background: isClassActive ? 'rgba(79,142,247,0.25)' : 'rgba(255,255,255,0.08)' }
+                                                            }}
+                                                        />
+                                                    );
+                                                })}
+                                            </Box>
+                                        </Box>
+                                    )}
+                                </Box>
+                            );
+                        })}
+                    </Box>
+
+                    {merging && <LinearProgress sx={{ mt: 3, borderRadius: 4, height: 4 }} />}
+                </DialogContent>
+                <DialogActions sx={{ px: 3, pb: 2.5 }}>
+                    <Button onClick={() => setMergeOpen(false)} disabled={merging} variant="outlined" size="small"
+                        sx={{ borderRadius: 2, textTransform: 'none' }}>Cancel</Button>
+                    <Button onClick={handleMerge} disabled={mergeSelection.length < 2 || !mergeName.trim() || merging} variant="contained" size="small"
+                        startIcon={merging ? <CircularProgress size={14} /> : <JoinInner />}
+                        sx={{ borderRadius: 2, textTransform: 'none' }}>
+                        {merging ? 'Merging...' : 'Merge Selected Models'}
                     </Button>
                 </DialogActions>
             </Dialog>

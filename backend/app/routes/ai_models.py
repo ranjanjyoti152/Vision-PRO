@@ -18,6 +18,7 @@ from app.models.ai_model import (
     AIModelResponse,
     ModelDownloadRequest,
     ModelUploadMeta,
+    MergeModelsRequest,
     AVAILABLE_YOLO_MODELS,
 )
 from app.config import settings
@@ -57,6 +58,36 @@ def _write_active_model(pt_path: str, model_name: str) -> None:
         "onnx_path": os.path.join(onnx_dir, f"{basename}.onnx"),
         "engine_path": pt_path.replace(".pt", ".engine"),
         "model_name": model_name,
+        "is_merged": False,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(ACTIVE_MODEL_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _write_active_merged_model(model_name: str, models: list[dict], selected_classes: dict = None) -> None:
+    """Persist the active merged model selection."""
+    os.makedirs(settings.MODELS_PATH, exist_ok=True)
+    onnx_dir = os.path.join(settings.MODELS_PATH, "onnx")
+    os.makedirs(onnx_dir, exist_ok=True)
+    
+    models_data = []
+    for m in models:
+        pt_path = m.get("file_path", str(settings.YOLO_MODELS_DIR / f"{m['name']}.pt"))
+        basename = os.path.splitext(os.path.basename(pt_path))[0]
+        models_data.append({
+            "model_id": m.get("id", ""),
+            "pt_path": pt_path,
+            "onnx_path": os.path.join(onnx_dir, f"{basename}.onnx"),
+            "engine_path": pt_path.replace(".pt", ".engine"),
+            "model_name": m["name"]
+        })
+
+    data = {
+        "model_name": model_name,
+        "is_merged": True,
+        "models": models_data,
+        "selected_classes": selected_classes or {},
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     with open(ACTIVE_MODEL_FILE, "w") as f:
@@ -102,6 +133,33 @@ async def _update_progress(model_id: str, **kwargs):
         {"_id": ObjectId(model_id)},
         {"$set": {f"metadata.{k}": v for k, v in kwargs.items()}},
     )
+
+
+def _extract_classes(file_path: str) -> list[str]:
+    """Helper to cleanly extract YOLO classes from a .pt file."""
+    try:
+        from ultralytics import YOLO
+        model = YOLO(file_path, verbose=False)
+        names = model.names
+        class_list = [names[i] for i in sorted(names.keys())]
+        del model
+        return class_list
+    except Exception as e:
+        logger.debug(f"Ultralytics extract failed: {e}, trying torch.load")
+        try:
+            import torch
+            ckpt = torch.load(file_path, map_location='cpu')
+            if 'model' in ckpt:
+                model = ckpt['model']
+                if hasattr(model, 'names'):
+                    names = model.names
+                    if isinstance(names, dict):
+                        return [names[i] for i in sorted(names.keys())]
+                    elif isinstance(names, list):
+                        return names
+        except Exception:
+            pass
+    return []
 
 
 def _download_model_sync(model_name: str, dest_path: str) -> int:
@@ -157,9 +215,13 @@ async def _background_download(model_id: str, model_name: str):
             return
 
         await _update_progress(model_id, status="downloading", progress=60, phase="Download complete")
+        
+        # Extract classes
+        class_list = await loop.run_in_executor(None, _extract_classes, dest_path)
+        
         await ai_models_collection().update_one(
             {"_id": ObjectId(model_id)},
-            {"$set": {"file_path": dest_path, "file_size_bytes": file_size}},
+            {"$set": {"file_path": dest_path, "file_size_bytes": file_size, "metadata.classes": class_list}},
         )
 
         # Phase 2: ONNX conversion (Jetson only)
@@ -238,6 +300,61 @@ async def download_model(
     }
 
 
+@router.post("/merge")
+async def merge_models(
+    request: MergeModelsRequest,
+    admin: dict = Depends(require_admin),
+):
+    """Create a new merged model configuration from multiple existing models."""
+    existing = await ai_models_collection().find_one({"name": request.name})
+    if existing:
+        raise HTTPException(status_code=409, detail="Model name already exists")
+
+    # Deduplicate requested ids
+    unique_model_ids = list(set(request.model_ids))
+    object_ids = [ObjectId(mid) for mid in unique_model_ids]
+    cursor = ai_models_collection().find({"_id": {"$in": object_ids}})
+    models = await cursor.to_list(length=len(unique_model_ids))
+    
+    if len(models) != len(unique_model_ids):
+        found_ids = [str(m["_id"]) for m in models]
+        missing_ids = [mid for mid in unique_model_ids if mid not in found_ids]
+        logger.error(f"Merge Models - MISSING IDs: {missing_ids}. Requested: {unique_model_ids}, Found: {found_ids}")
+        raise HTTPException(status_code=400, detail=f"Models not found: {missing_ids}")
+        
+    for m in models:
+        if m.get("type") == "merged":
+            raise HTTPException(status_code=400, detail="Cannot merge an already merged model")
+        if m.get("metadata", {}).get("status") not in ["ready", None]:
+             raise HTTPException(status_code=400, detail=f"Model {m['name']} is not ready")
+
+    merged_models_meta = [
+        {"id": str(m["_id"]), "name": m["name"], "file_path": m.get("file_path", "")} 
+        for m in models
+    ]
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "name": request.name,
+        "type": "merged",
+        "version": "merged",
+        "file_path": "",
+        "file_size_bytes": sum(m.get("file_size_bytes", 0) for m in models),
+        "is_default": False,
+        "is_custom": True,
+        "metadata": {
+            "status": "ready",
+            "merged_models": merged_models_meta,
+            "selected_classes": request.selected_classes
+        },
+        "created_at": now,
+    }
+
+    result = await ai_models_collection().insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return _model_doc_to_response(doc)
+
+
 @router.get("/{model_id}/progress")
 async def get_model_progress(
     model_id: str,
@@ -271,9 +388,12 @@ async def set_default_model(
     if not model:
         raise HTTPException(status_code=404, detail="Model not found")
 
-    # Unset current default of same type
+    # Unset current default of same type (or YOLO if setting a merged default)
+    # Merged models act as the default YOLO model
+    target_type = model["type"] if model["type"] != "merged" else "yolo"
+    
     await ai_models_collection().update_many(
-        {"type": model["type"], "is_default": True},
+        {"type": {"$in": ["yolo", "merged"]}, "is_default": True},
         {"$set": {"is_default": False}},
     )
 
@@ -284,22 +404,32 @@ async def set_default_model(
     )
 
     # Write to shared volume config so DeepStream picks it up on restart
-    pt_path = model.get("file_path", str(settings.YOLO_MODELS_DIR / f"{model['name']}.pt"))
-    _write_active_model(pt_path, model["name"])
-
-    # On Jetson: trigger ONNX conversion in the background so it's ready
-    # before the user restarts the DeepStream container
     onnx_converted = False
-    if settings.IS_JETSON:
-        try:
-            from app.deepstream.onnx_convert import convert_pt_to_onnx
-            onnx_dir = os.path.join(settings.MODELS_PATH, "onnx")
-            basename = os.path.splitext(os.path.basename(pt_path))[0]
-            onnx_path = os.path.join(onnx_dir, f"{basename}.onnx")
-            convert_pt_to_onnx(pt_path, onnx_path)
-            onnx_converted = True
-        except Exception as e:
-            pass  # ONNX conversion will happen at DeepStream startup too
+    
+    if model["type"] == "merged":
+        # It's a merged model
+        _write_active_merged_model(
+            model["name"], 
+            model["metadata"]["merged_models"], 
+            model["metadata"].get("selected_classes")
+        )
+    else:
+        # Standard model
+        pt_path = model.get("file_path", str(settings.YOLO_MODELS_DIR / f"{model['name']}.pt"))
+        _write_active_model(pt_path, model["name"])
+
+        # On Jetson: trigger ONNX conversion in the background so it's ready
+        # before the user restarts the DeepStream container
+        if settings.IS_JETSON:
+            try:
+                from app.deepstream.onnx_convert import convert_pt_to_onnx
+                onnx_dir = os.path.join(settings.MODELS_PATH, "onnx")
+                basename = os.path.splitext(os.path.basename(pt_path))[0]
+                onnx_path = os.path.join(onnx_dir, f"{basename}.onnx")
+                convert_pt_to_onnx(pt_path, onnx_path)
+                onnx_converted = True
+            except Exception as e:
+                pass  # ONNX conversion will happen at DeepStream startup too
 
     # Also hot-reload the standard YOLO worker if not using DeepStream
     if not settings.DEEPSTREAM_ENABLED:
@@ -381,7 +511,10 @@ async def upload_custom_model(
         "file_size_bytes": file_size,
         "is_default": False,
         "is_custom": True,
-        "metadata": {"original_filename": file.filename},
+        "metadata": {
+            "original_filename": file.filename,
+            "classes": _extract_classes(filepath)
+        },
         "created_at": now,
     }
 

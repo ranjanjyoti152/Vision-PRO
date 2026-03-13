@@ -11,6 +11,31 @@ from app.core.security import get_current_user
 router = APIRouter(prefix="/api/heatmaps", tags=["Heatmaps"])
 
 
+def _extract_event_bboxes(event: dict) -> list[dict]:
+    """Return all usable bounding boxes from an event.
+
+    Prefer per-object boxes from detected_objects (merged-model friendly),
+    and fall back to the legacy primary bounding_box.
+    """
+    boxes: list[dict] = []
+
+    for obj in event.get("detected_objects", []) or []:
+        bbox = obj.get("bbox") if isinstance(obj, dict) else None
+        if not isinstance(bbox, dict):
+            continue
+        if all(k in bbox for k in ("x", "y", "w", "h")):
+            boxes.append(bbox)
+
+    if boxes:
+        return boxes
+
+    bbox = event.get("bounding_box")
+    if isinstance(bbox, dict) and all(k in bbox for k in ("x", "y", "w", "h")):
+        return [bbox]
+
+    return []
+
+
 @router.get("/{camera_id}")
 async def get_heatmap(
     camera_id: str,
@@ -28,14 +53,17 @@ async def get_heatmap(
     # Lookup camera for resolution info (allows % normalisation)
     cam = await cameras_collection().find_one({"_id": ObjectId(camera_id)}, {"resolution": 1})
 
-    # Pull events that have a bounding_box
+    # Pull events that have at least one usable detection box
     cursor = events_collection().find(
         {
             "camera_id": camera_id,
             "timestamp": {"$gte": cutoff},
-            "bounding_box": {"$ne": None, "$exists": True},
+            "$or": [
+                {"detected_objects": {"$exists": True, "$ne": []}},
+                {"bounding_box": {"$exists": True, "$ne": None}},
+            ],
         },
-        {"bounding_box": 1},
+        {"bounding_box": 1, "detected_objects": 1},
     )
 
     events = await cursor.to_list(length=5000)
@@ -43,31 +71,33 @@ async def get_heatmap(
     # Initialise empty grid
     grid = [[0] * grid_w for _ in range(grid_h)]
 
-    # Try to get the camera's stream resolution from StreamManager for proper normalisation
-    frame_w, frame_h = 1920, 1080  # Fallback safe defaults
+    # Use camera resolution if available for proper normalisation
+    frame_w, frame_h = 1920, 1080
+    resolution = (cam or {}).get("resolution") if isinstance(cam, dict) else None
+    if isinstance(resolution, dict):
+        frame_w = int(resolution.get("width", frame_w) or frame_w)
+        frame_h = int(resolution.get("height", frame_h) or frame_h)
+    frame_w = max(frame_w, 1)
+    frame_h = max(frame_h, 1)
 
     total_heat = 0
     for event in events:
-        bbox = event.get("bounding_box", {})
-        if not bbox:
-            continue
+        for bbox in _extract_event_bboxes(event):
+            bx = int(bbox.get("x", 0))
+            by = int(bbox.get("y", 0))
+            bw = int(bbox.get("w", 0))
+            bh = int(bbox.get("h", 0))
 
-        # bbox fields: x, y, w, h (top-left corner format)
-        bx = bbox.get("x", 0)
-        by = bbox.get("y", 0)
-        bw = bbox.get("w", 0)
-        bh = bbox.get("h", 0)
+            # Centre of the bounding box
+            cx = bx + bw // 2
+            cy = by + bh // 2
 
-        # Centre of the bounding box
-        cx = bx + bw // 2
-        cy = by + bh // 2
+            # Normalize to grid coordinates
+            gx = min(int(cx / frame_w * grid_w), grid_w - 1)
+            gy = min(int(cy / frame_h * grid_h), grid_h - 1)
 
-        # Normalize to grid coordinates
-        gx = min(int(cx / frame_w * grid_w), grid_w - 1)
-        gy = min(int(cy / frame_h * grid_h), grid_h - 1)
-
-        grid[gy][gx] += 1
-        total_heat += 1
+            grid[gy][gx] += 1
+            total_heat += 1
 
     # Flatten to a 1D list for JSON serialization
     flat = [val for row in grid for val in row]
@@ -91,8 +121,29 @@ async def list_camera_heatmap_summary(
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
     pipeline = [
-        {"$match": {"timestamp": {"$gte": cutoff}, "bounding_box": {"$exists": True, "$ne": None}}},
-        {"$group": {"_id": "$camera_id", "count": {"$sum": 1}}},
+        {
+            "$match": {
+                "timestamp": {"$gte": cutoff},
+                "$or": [
+                    {"detected_objects": {"$exists": True, "$ne": []}},
+                    {"bounding_box": {"$exists": True, "$ne": None}},
+                ],
+            }
+        },
+        {
+            "$project": {
+                "camera_id": 1,
+                "det_count": {
+                    "$let": {
+                        "vars": {
+                            "obj_count": {"$size": {"$ifNull": ["$detected_objects", []]}}
+                        },
+                        "in": {"$cond": [{"$gt": ["$$obj_count", 0]}, "$$obj_count", 1]},
+                    }
+                },
+            }
+        },
+        {"$group": {"_id": "$camera_id", "count": {"$sum": "$det_count"}}},
         {"$sort": {"count": -1}},
     ]
 

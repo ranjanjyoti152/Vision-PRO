@@ -10,6 +10,7 @@ from enum import Enum
 class ModelType(str, Enum):
     YOLO = "yolo"
     FACE = "face"
+    MERGED = "merged"
 
 
 class AIModelResponse(BaseModel):
@@ -33,6 +34,16 @@ class ModelDownloadRequest(BaseModel):
     model_name: str = Field(
         ...,
         description="YOLO model name, e.g. yolov8n, yolov10s, yolo11m"
+    )
+
+
+class MergeModelsRequest(BaseModel):
+    """Schema for requesting a merge of multiple YOLO models."""
+    name: str = Field(..., min_length=1, max_length=100)
+    model_ids: list[str] = Field(..., min_length=2, description="List of model IDs to merge")
+    selected_classes: dict[str, list[str]] = Field(
+        default_factory=dict, 
+        description="Map of model ID to list of active class names. If empty, all classes are active."
     )
 
 

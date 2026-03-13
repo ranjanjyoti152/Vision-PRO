@@ -51,15 +51,22 @@ NUM_CLASSES: int = 80
 _latest_jpeg: Dict[str, bytes] = {}  # camera_id → most recent JPEG for snapshots
 
 
-def detect_model_classes() -> list:
-    """Auto-detect class names from the .pt model file."""
-    pt_path = os.environ.get("YOLO_PT_PATH", "/models/yolo/yolov8n.pt")
+def detect_model_classes(pt_path: str = None) -> list:
+    """Auto-detect class names from a single .pt model file."""
+    if pt_path is None:
+        pt_path = os.environ.get("YOLO_PT_PATH", "/models/yolo/yolov8n.pt")
     try:
         from ultralytics import YOLO
-        model = YOLO(pt_path)
+        import torch
+        # Disable verbose logging to keep standard out clean during multi-model load
+        model = YOLO(pt_path, verbose=False)
         names = model.names  # {0: 'class1', 1: 'class2', ...}
         class_list = [names[i] for i in sorted(names.keys())]
         logger.info(f"🏷️  Detected {len(class_list)} classes from {pt_path}: {class_list}")
+        # Free memory explicitely since we only need the class list
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return class_list
     except Exception as e:
         logger.warning(f"Could not detect classes from {pt_path}: {e}")
@@ -90,12 +97,12 @@ detected-min-h=0
 """
 
 
-def write_nvinfer_config(engine_path: str, threshold: float, num_classes: int) -> str:
+def write_nvinfer_config(engine_path: str, threshold: float, num_classes: int, class_names: list, unique_id: int = 1, onnx_path: str = "") -> str:
     """Write nvinfer config file. On Jetson, includes onnx-file for auto-rebuild."""
-    config_path = "/tmp/nvinfer_yolo.txt"
+    config_path = f"/tmp/nvinfer_yolo_{unique_id}.txt"
+    l_path = f"/tmp/labels_{unique_id}.txt"
 
     # Check if an ONNX model exists alongside the engine
-    onnx_path = os.environ.get("ONNX_MODEL_PATH", "")
     if not onnx_path:
         candidate = engine_path.replace(".engine", ".onnx").replace("/yolo/", "/onnx/")
         if os.path.exists(candidate):
@@ -105,15 +112,17 @@ def write_nvinfer_config(engine_path: str, threshold: float, num_classes: int) -
     if onnx_path and os.path.exists(onnx_path):
         onnx_file_line = f"onnx-file={onnx_path}\n"
 
+    # Output Tensor meta is REQUIRED for our pad probe logic to work smoothly
     with open(config_path, "w") as f:
         f.write(NVINFER_CONFIG_TMPL.format(
             engine_path=engine_path,
             threshold=threshold,
             onnx_file_line=onnx_file_line,
             num_classes=num_classes,
-        ))
-    with open("/tmp/labels.txt", "w") as f:
-        f.write("\n".join(MODEL_CLASSES))
+        ).replace("gie-unique-id=1", f"gie-unique-id={unique_id}").replace("labelfile-path=/tmp/labels.txt", f"labelfile-path={l_path}"))
+        
+    with open(l_path, "w") as f:
+        f.write("\n".join(class_names))
     return config_path
 
 
@@ -143,7 +152,7 @@ def _nms_boxes(boxes, scores, iou_threshold=0.45):
     return keep
 
 
-def parse_yolo_tensor(tensor_data: np.ndarray, conf_threshold: float, img_w: int, img_h: int):
+def parse_yolo_tensor(tensor_data: np.ndarray, conf_threshold: float, img_w: int, img_h: int, class_offset: int, model_classes: list, active_class_names: list = None):
     """
     Parse raw YOLO output tensor [1, (4+num_classes), num_anchors] → list of detections.
 
@@ -196,12 +205,15 @@ def parse_yolo_tensor(tensor_data: np.ndarray, conf_threshold: float, img_w: int
         keep = _nms_boxes(cls_boxes, cls_scores, iou_threshold=0.45)
         for k in keep:
             bx = cls_boxes[k]
+            c_name = model_classes[int(cls_id)] if int(cls_id) < len(model_classes) else f"class_{cls_id}"
+            
+            if active_class_names is not None and c_name not in active_class_names:
+                continue
+
             final_dets.append({
-                "class_id": int(cls_id),
-                "class_name": MODEL_CLASSES[int(cls_id)] if int(cls_id) < len(MODEL_CLASSES) else f"class_{cls_id}",
-                "event_type": EVENT_CLASS_MAP.get(
-                    MODEL_CLASSES[int(cls_id)] if int(cls_id) < len(MODEL_CLASSES) else "", "custom"
-                ),
+                "class_id": global_cls_id,
+                "class_name": c_name,
+                "event_type": EVENT_CLASS_MAP.get(c_name, "custom"),
                 "confidence": round(float(cls_scores[k]), 4),
                 "bbox": [
                     round(float(max(0, bx[0])), 1),
@@ -239,13 +251,26 @@ def osd_sink_pad_buffer_probe(pad, info, camera_id):
 
         detections = []
 
-        # Try to read raw tensor output from nvinfer (output-tensor-meta=1)
+        # Try to read raw tensor output from all nvinfer engines (output-tensor-meta=1)
         l_user = frame_meta.frame_user_meta_list
         while l_user:
             try:
                 user_meta = pyds.NvDsUserMeta.cast(l_user.data)
                 if user_meta.base_meta.meta_type == pyds.NvDsMetaType.NVDSINFER_TENSOR_OUTPUT_META:
                     tensor_meta = pyds.NvDsInferTensorMeta.cast(user_meta.user_meta_data)
+                    uid = tensor_meta.unique_id
+                    
+                    # Ensure we have class definitions for this model
+                    if hasattr(bridge, "model_configs") and uid in bridge.model_configs:
+                        cfg = bridge.model_configs[uid]
+                        class_offset = cfg["class_offset"]
+                        model_classes = cfg["class_names"]
+                        active_class_names = cfg.get("active_class_names")
+                    else:
+                        class_offset = 0
+                        model_classes = MODEL_CLASSES
+                        active_class_names = None
+
                     # Get first output layer
                     layer = pyds.get_nvds_LayerInfo(tensor_meta, 0)
                     ptr = ctypes.cast(pyds.get_ptr(layer.buffer), ctypes.POINTER(ctypes.c_float))
@@ -255,7 +280,9 @@ def osd_sink_pad_buffer_probe(pad, info, camera_id):
                     for d in dims:
                         total *= d
                     arr = np.ctypeslib.as_array(ptr, shape=(total,)).reshape(dims).copy()
-                    detections = parse_yolo_tensor(arr, CONF_THRESHOLD, img_w, img_h)
+                    
+                    new_dets = parse_yolo_tensor(arr, CONF_THRESHOLD, img_w, img_h, class_offset, model_classes, active_class_names)
+                    detections.extend(new_dets)
             except Exception as e:
                 logger.debug(f"Tensor parse error: {e}")
 
@@ -264,18 +291,36 @@ def osd_sink_pad_buffer_probe(pad, info, camera_id):
             except StopIteration:
                 break
 
-        # Fallback: also check NvDsObjectMeta (works if parser is available)
+        # Fallback: also check NvDsObjectMeta (works if parser is available inside TensorRT engine)
         if not detections:
             l_obj = frame_meta.obj_meta_list
             while l_obj:
                 try:
                     obj_meta = pyds.NvDsObjectMeta.cast(l_obj.data)
-                    class_id = obj_meta.class_id
-                    class_name = MODEL_CLASSES[class_id] if class_id < len(MODEL_CLASSES) else f"class_{class_id}"
+                    uid = obj_meta.unique_component_id
+
+                    # Map global class ID and name
+                    if hasattr(bridge, "model_configs") and uid in bridge.model_configs:
+                        cfg = bridge.model_configs[uid]
+                        class_offset = cfg["class_offset"]
+                        model_classes = cfg["class_names"]
+                        active_class_names = cfg.get("active_class_names")
+                    else:
+                        class_offset = 0
+                        model_classes = MODEL_CLASSES
+                        active_class_names = None
+
+                    local_class_id = obj_meta.class_id
+                    global_class_id = local_class_id + class_offset
+                    class_name = model_classes[local_class_id] if local_class_id < len(model_classes) else f"class_{local_class_id}"
+                    
+                    if active_class_names is not None and class_name not in active_class_names:
+                        continue
+                        
                     conf = obj_meta.confidence
                     rect = obj_meta.rect_params
                     detections.append({
-                        "class_id":   class_id,
+                        "class_id":   global_class_id,
                         "class_name": class_name,
                         "event_type": EVENT_CLASS_MAP.get(class_name, "custom"),
                         "confidence": round(float(conf), 4),
@@ -336,8 +381,10 @@ def on_new_sample(appsink, camera_id: str):
 
 # ─── Build pipeline ──────────────────────────────────────────────────────────
 
-def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pipeline:
-    """Build a GStreamer DeepStream pipeline for one camera."""
+def build_pipeline(camera_id: str, rtsp_url: str, configs: list) -> Gst.Pipeline:
+    """Build a GStreamer DeepStream pipeline for one camera.
+    Supports chaining multiple nvinfer elements when configs list length > 1.
+    """
     pipeline = Gst.Pipeline()
 
     def make(factory, name):
@@ -370,7 +417,15 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
 
     # Branch 1 — inference (no tracker with network-type=100)
     queue1   = make("queue",          f"q_inf_{safe_id}")
-    infer    = make("nvinfer",        f"nvinfer_{safe_id}")
+    
+    # Create N nvinfer elements sequentially
+    infers = []
+    for idx, cfg in enumerate(configs, 1):
+        infer = make("nvinfer", f"nvinfer_{safe_id}_{idx}")
+        infer.set_property("config-file-path", cfg["config_path"])
+        infer.set_property("unique-id", idx)
+        infers.append(infer)
+        
     fakesink = make("fakesink",       f"fsink_{safe_id}")
 
     # Branch 2 — JPEG for WebSocket (Hardware Accelerated)
@@ -394,9 +449,6 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     src.set_property("drop-on-latency", False)
     src.set_property("buffer-mode", 0)
 
-    infer.set_property("config-file-path", nvinfer_config)
-    infer.set_property("unique-id", 1)
-
     fakesink.set_property("sync", False)
     fakesink.set_property("async", False)
 
@@ -408,8 +460,8 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
 
     # Add all to pipeline
     for el in [src, depay, parse, decoder, conv1, caps1, tee,
-               queue1, streammux, infer, fakesink,
-               queue2, conv2, caps2, jpegenc, appsink]:
+               queue1, streammux, fakesink,
+               queue2, conv2, caps2, jpegenc, appsink] + infers:
         pipeline.add(el)
 
     # Handle dynamic rtspsrc → depay pad
@@ -432,15 +484,19 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     queue1_sink = queue1.get_static_pad("sink")
     tee_src1.link(queue1_sink)
 
-    # queue1 → streammux (pad request) → nvinfer → tracker → conv_inf → fakesink
+    # queue1 → streammux (pad request) → [nvinfer_1 → nvinfer_2 → ...] → fakesink
     mux_sinkpad = streammux.request_pad_simple("sink_0")
     if not mux_sinkpad:
         mux_sinkpad = streammux.get_request_pad("sink_0")
     queue1_src = queue1.get_static_pad("src")
     queue1_src.link(mux_sinkpad)
 
-    streammux.link(infer)
-    infer.link(fakesink)
+    # Chain streammux -> infer1 -> infer2 -> ... -> fakesink
+    prev_element = streammux
+    for infer in infers:
+        prev_element.link(infer)
+        prev_element = infer
+    prev_element.link(fakesink)
 
     # Tee → branch 2 (JPEG)
     tee_src2 = tee.get_request_pad("src_%u")
@@ -451,9 +507,10 @@ def build_pipeline(camera_id: str, rtsp_url: str, nvinfer_config: str) -> Gst.Pi
     caps2.link(jpegenc)
     jpegenc.link(appsink)
 
-    # Add pad probe on nvinfer src pad for raw tensor detection metadata
-    infer_src = infer.get_static_pad("src")
-    infer_src.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, camera_id)
+    # Add pad probe on the LAST nvinfer src pad for raw tensor detection metadata
+    # The last element has accumulated metadatas from all previous nvinfer elements
+    last_infer_src = infers[-1].get_static_pad("src")
+    last_infer_src.add_probe(Gst.PadProbeType.BUFFER, osd_sink_pad_buffer_probe, camera_id)
 
     return pipeline
 
@@ -504,9 +561,75 @@ def main():
 
     # Detect model classes and write nvinfer config
     global MODEL_CLASSES, NUM_CLASSES
-    MODEL_CLASSES = detect_model_classes()
+    
+    active_configs = []
+    
+    # Read active model JSON to see if we have a merged model
+    # Convert script should have already been called on the entrypoint wrapper
+    active_json_path = "/models/active_model.json"
+    if os.path.exists(active_json_path):
+        import json
+        try:
+            with open(active_json_path, 'r') as f:
+                active_cfg = json.load(f)
+        except Exception:
+            active_cfg = {}
+    else:
+        active_cfg = {}
+        
+    bridge = DeepStreamBridge(ZMQ_ENDPOINT)
+    bridge.model_configs = {} # Store info for parser
+    current_class_offset = 0
+
+    if active_cfg.get("is_merged", False) and "models" in active_cfg:
+        selected_classes_map = active_cfg.get("selected_classes", {})
+        logger.info(f"🧩 Loading {len(active_cfg['models'])} models into pipeline sequentially ...")
+        for i, m in enumerate(active_cfg["models"], 1):
+            c_names = detect_model_classes(m["pt_path"])
+            
+            # Allow fallback if no selection is available
+            model_id = m.get("model_id", "")
+            active_class_names = selected_classes_map.get(model_id)
+            if active_class_names is None:
+                active_class_names = c_names
+                
+            cfg_path = write_nvinfer_config(
+                engine_path=m["engine_path"], 
+                threshold=CONF_THRESHOLD, 
+                num_classes=len(c_names), 
+                class_names=c_names,
+                unique_id=i,
+                onnx_path=m.get("onnx_path", "")
+            )
+            active_configs.append({"config_path": cfg_path, "class_offset": current_class_offset})
+            bridge.model_configs[i] = {
+                "class_offset": current_class_offset, 
+                "class_names": c_names,
+                "active_class_names": active_class_names
+            }
+            
+            MODEL_CLASSES.extend(c_names)
+            current_class_offset += len(c_names)
+    else:
+        # Standard fallback to single model via env vars
+        engine_path = os.environ.get("TRT_ENGINE_PATH", "/models/yolo/yolov8n.engine")
+        pt_path = os.environ.get("YOLO_PT_PATH", "/models/yolo/yolov8n.pt")
+        c_names = detect_model_classes(pt_path)
+        cfg_path = write_nvinfer_config(
+            engine_path=engine_path, 
+            threshold=CONF_THRESHOLD, 
+            num_classes=len(c_names),
+            class_names=c_names,
+            unique_id=1,
+            onnx_path=os.environ.get("ONNX_MODEL_PATH", "")
+        )
+        active_configs.append({"config_path": cfg_path, "class_offset": current_class_offset})
+        bridge.model_configs[1] = {"class_offset": current_class_offset, "class_names": c_names}
+        
+        MODEL_CLASSES = c_names
+        
     NUM_CLASSES = len(MODEL_CLASSES)
-    nvinfer_config = write_nvinfer_config(ENGINE_PATH, CONF_THRESHOLD, NUM_CLASSES)
+    # ----------------------------------------------------
 
     # Connect ZMQ bridge
     bridge = DeepStreamBridge(ZMQ_ENDPOINT)
@@ -528,7 +651,7 @@ def main():
     for cam in cameras:
         logger.info(f"  → {cam['name']} ({cam['id']}): {cam['rtsp_url']}")
         try:
-            p = build_pipeline(cam["id"], cam["rtsp_url"], nvinfer_config)
+            p = build_pipeline(cam["id"], cam["rtsp_url"], active_configs)
             ret = p.set_state(Gst.State.PLAYING)
             if ret == Gst.StateChangeReturn.FAILURE:
                 logger.error(f"❌ Pipeline failed to start for camera {cam['id']}")

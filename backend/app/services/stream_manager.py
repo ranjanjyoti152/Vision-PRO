@@ -1,32 +1,56 @@
 """
 Camera Stream Manager – RTSP reading, JPEG encoding, WebSocket broadcast.
 
-Each camera gets a dedicated CameraStream task that:
-  1. Opens the RTSP URL via OpenCV
-  2. Reads frames in a thread pool (non-blocking)
-  3. JPEG-encodes and broadcasts to WebSocket subscribers
-  4. Auto-reconnects with exponential back-off on failure
+Each camera gets a DEDICATED BACKGROUND THREAD that:
+  1. Opens the RTSP URL via OpenCV (GStreamer HW decode preferred)
+  2. Reads frames continuously at native speed
+  3. JPEG-encodes the latest frame
+  4. Pushes encoded bytes to an asyncio queue for WebSocket broadcast
+  5. Auto-reconnects on failure
+
+The asyncio event loop only handles the lightweight queue→WebSocket broadcast,
+keeping it free for HTTP/WS request handling.
 """
 import asyncio
 import logging
+import threading
 import time
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 
-# Force OpenCV FFmpeg backend to use TCP for RTSP and enable NVIDIA hardware decoding if available
-# The env var can be overridden via docker-compose to add hwaccel;cuda when FFmpeg is compiled with NVIDIA
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|loglevel;quiet")
+# Force OpenCV FFmpeg backend to use TCP for RTSP and enable error resilience.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|err_detect;ignore_err|fflags;discardcorrupt"
+)
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
 
 import cv2
 cv2.setLogLevel(0)  # 0 = SILENT
+
+# Redirect native stderr (fd 2) to /dev/null to silence FFmpeg's internal h264
+# decoder warnings. Python logging still works via the saved fd.
+try:
+    import sys as _sys
+    _saved_stderr_fd = os.dup(2)
+    _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(_devnull_fd, 2)
+    os.close(_devnull_fd)
+    _sys.stderr = os.fdopen(_saved_stderr_fd, "w", closefd=False)
+except Exception:
+    pass
+
 import numpy as np
 
 from app.config import settings
 from app.core.websocket import ws_manager
 
 logger = logging.getLogger(__name__)
+
+# Max pixels to stream (width). Frames wider than this are resized before JPEG.
+# Keeps JPEG encode fast and WebSocket payloads small.
+_STREAM_MAX_WIDTH = 640
 
 
 # ---------------------------------------------------------------------------
@@ -60,46 +84,58 @@ class StreamHealth:
 
 
 class CameraStream:
-    """Manages a single RTSP camera stream in a background task."""
+    """Manages a single RTSP camera stream with a dedicated reader thread."""
 
     def __init__(self, camera_id: str, rtsp_url: str, target_fps: int = None):
         if target_fps is None:
-            from app.config import settings
             target_fps = settings.STREAM_MAX_FPS
         self.camera_id = camera_id
         self.rtsp_url = rtsp_url
         self.target_fps = target_fps
 
-        self._task: Optional[asyncio.Task] = None
         self._running = False
         self._cap: Optional[cv2.VideoCapture] = None
-        self._latest_frame: Optional[bytes] = None  # JPEG bytes
+        self._latest_frame: Optional[bytes] = None   # JPEG bytes
         self._latest_raw: Optional[np.ndarray] = None
+
+        # Dedicated reader thread
+        self._thread: Optional[threading.Thread] = None
+        # Asyncio task for broadcast
+        self._broadcast_task: Optional[asyncio.Task] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # Health tracking
         self.health = StreamHealth(camera_id=camera_id)
         self._start_time: float = 0.0
 
+        # JPEG encode params (pre-allocated for speed)
+        self._jpeg_quality = min(settings.STREAM_JPEG_QUALITY, 70)
+        self._encode_params = [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality]
+
     # ---- public ----------------------------------------------------------
 
     def start(self) -> None:
-        """Create the background asyncio task."""
+        """Start the dedicated reader thread and broadcast task."""
         if self._running:
             return
         self._running = True
         self._start_time = time.time()
-        self._task = asyncio.create_task(self._run_loop(), name=f"stream-{self.camera_id}")
+        self._loop = asyncio.get_event_loop()
+
+        # Start dedicated reader thread (not from thread pool!)
+        self._thread = threading.Thread(
+            target=self._reader_thread,
+            name=f"cam-{self.camera_id[:8]}",
+            daemon=True
+        )
+        self._thread.start()
         logger.info(f"▶  Stream started: {self.camera_id}")
 
     async def stop(self) -> None:
-        """Cancel the background task and release the capture."""
+        """Stop the reader thread and release capture."""
         self._running = False
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
         self._release_capture()
         self.health.connected = False
         logger.info(f"⏹  Stream stopped: {self.camera_id}")
@@ -109,87 +145,95 @@ class CameraStream:
         return self._latest_frame
 
     def get_raw_frame(self) -> Optional[np.ndarray]:
-        """Return latest raw BGR frame (for AI pipelines later)."""
+        """Return latest raw BGR frame (for AI pipelines)."""
         return self._latest_raw
 
-    # ---- internal --------------------------------------------------------
+    # ---- reader thread (runs in dedicated OS thread) ---------------------
 
-    async def _run_loop(self) -> None:
-        """Main loop: connect → read → encode → broadcast, with reconnect."""
+    def _reader_thread(self) -> None:
+        """Dedicated thread: connect → read → encode → push to event loop."""
         backoff = 2.0
 
         while self._running:
             try:
                 # Connect
-                connected = await self._connect()
-                if not connected:
+                cap = self._open_capture()
+                if cap is None:
                     self.health.error_count += 1
                     self.health.last_error = "Failed to open RTSP URL"
                     logger.warning(f"⚠  Cannot open: {self.camera_id} – retrying in {backoff}s")
-                    await asyncio.sleep(backoff)
+                    self._sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
                     self.health.reconnect_count += 1
                     continue
 
-                # Successfully connected – reset backoff
+                self._cap = cap
                 backoff = 2.0
                 self.health.connected = True
                 self.health.last_error = ""
                 logger.info(f"🟢 Connected: {self.camera_id}")
 
                 # Read loop
-                await self._read_loop()
+                self._read_loop_sync()
 
-            except asyncio.CancelledError:
-                break
             except Exception as e:
                 self.health.connected = False
                 self.health.error_count += 1
                 self.health.last_error = str(e)
                 logger.error(f"❌ Stream error {self.camera_id}: {e}")
-                await asyncio.sleep(backoff)
+                self._sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
                 self.health.reconnect_count += 1
 
         self._release_capture()
 
-    async def _connect(self) -> bool:
-        """Open the RTSP connection in a thread (blocking call)."""
+    def _sleep(self, seconds: float) -> None:
+        """Sleep that can be interrupted by stop()."""
+        end = time.time() + seconds
+        while self._running and time.time() < end:
+            time.sleep(0.1)
+
+    def _open_capture(self) -> Optional[cv2.VideoCapture]:
+        """Try GStreamer (HW) first, then FFmpeg fallback."""
         self._release_capture()
 
-        def _open():
-            # FFmpeg options are already set at module level (line 19)
-
-            cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-            # Use TCP transport to avoid UDP packet loss causing h264 decode errors
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        # Attempt 1: GStreamer with decodebin (auto-selects nvv4l2decoder on Jetson)
+        gst_pipeline = (
+            f'rtspsrc location="{self.rtsp_url}" latency=0 '
+            f'protocols=tcp drop-on-latency=true ! '
+            f'decodebin ! videoconvert ! '
+            f'video/x-raw,format=BGR ! '
+            f'appsink drop=1 max-buffers=1 sync=false'
+        )
+        try:
+            cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
             if cap.isOpened():
-                actual = cap.get(cv2.CAP_PROP_FPS)
-                return cap, actual
+                logger.info(f"🎬 {self.camera_id}: GStreamer HW decoder (realtime)")
+                return cap
             cap.release()
+        except Exception:
+            pass
 
-            # Retry with TCP transport option in URL
-            rtsp_tcp = self.rtsp_url
-            if '?' not in rtsp_tcp:
-                rtsp_tcp += '?tcp'
-            cap2 = cv2.VideoCapture(rtsp_tcp, cv2.CAP_FFMPEG)
-            cap2.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap2.set(cv2.CAP_PROP_FPS, self.target_fps)
-            if cap2.isOpened():
-                actual = cap2.get(cv2.CAP_PROP_FPS)
-                return cap2, actual
-            cap2.release()
-            return None, 0
+        # Attempt 2: FFmpeg
+        cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if cap.isOpened():
+            logger.info(f"📹 {self.camera_id}: FFmpeg decoder")
+            return cap
+        cap.release()
 
-        result = await asyncio.to_thread(_open)
-        self._cap, actual_fps = result
-        if self._cap is not None:
-            logger.info(f"📷 {self.camera_id}: requested {self.target_fps} FPS, camera reports {actual_fps:.1f} FPS")
-        return self._cap is not None
+        # Attempt 3: FFmpeg with TCP in URL
+        rtsp_tcp = self.rtsp_url + ('&tcp' if '?' in self.rtsp_url else '?tcp')
+        cap = cv2.VideoCapture(rtsp_tcp, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if cap.isOpened():
+            logger.info(f"📹 {self.camera_id}: FFmpeg decoder (TCP)")
+            return cap
+        cap.release()
+        return None
 
-    async def _read_loop(self) -> None:
-        """Read frames at target FPS, encode, and broadcast."""
+    def _read_loop_sync(self) -> None:
+        """Synchronous read loop running in the dedicated thread."""
         frame_interval = 1.0 / self.target_fps
         fps_counter = 0
         fps_start = time.time()
@@ -197,30 +241,43 @@ class CameraStream:
         while self._running and self._cap and self._cap.isOpened():
             loop_start = time.time()
 
-            # Read frame in thread pool (blocking I/O)
-            ret, frame = await asyncio.to_thread(self._cap.read)
-
+            ret, frame = self._cap.read()
             if not ret or frame is None:
                 logger.warning(f"⚠  Frame read failed: {self.camera_id} – reconnecting")
                 self.health.connected = False
-                break  # will trigger reconnect in _run_loop
+                break
 
-            # Store raw frame
+            # Store raw frame (full resolution for AI)
             self._latest_raw = frame
 
-            # JPEG encode in thread pool
-            jpeg = await asyncio.to_thread(self._encode_jpeg, frame)
-            if jpeg is not None:
+            # Resize for streaming if too wide (saves JPEG encode time + bandwidth)
+            h, w = frame.shape[:2]
+            if w > _STREAM_MAX_WIDTH:
+                scale = _STREAM_MAX_WIDTH / w
+                frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale,
+                                   interpolation=cv2.INTER_NEAREST)
+
+            # JPEG encode
+            ok, buf = cv2.imencode(".jpg", frame, self._encode_params)
+            if ok:
+                jpeg = buf.tobytes()
                 self._latest_frame = jpeg
                 self.health.frame_count += 1
                 self.health.last_frame_time = time.time()
                 self.health.uptime_seconds = time.time() - self._start_time
 
-                # Broadcast to WebSocket subscribers
-                channel = f"camera:{self.camera_id}"
-                await ws_manager.broadcast_bytes(channel, jpeg)
+                # Push to event loop for WebSocket broadcast (non-blocking)
+                if self._loop and not self._loop.is_closed():
+                    channel = f"camera:{self.camera_id}"
+                    try:
+                        self._loop.call_soon_threadsafe(
+                            asyncio.ensure_future,
+                            ws_manager.broadcast_bytes(channel, jpeg)
+                        )
+                    except RuntimeError:
+                        pass  # Loop closed during shutdown
 
-            # FPS calculation
+            # FPS tracking
             fps_counter += 1
             elapsed = time.time() - fps_start
             if elapsed >= 1.0:
@@ -229,18 +286,10 @@ class CameraStream:
                 fps_start = time.time()
 
             # Throttle to target FPS
-            processing_time = time.time() - loop_start
-            sleep_time = frame_interval - processing_time
+            dt = time.time() - loop_start
+            sleep_time = frame_interval - dt
             if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
-
-    def _encode_jpeg(self, frame: np.ndarray) -> Optional[bytes]:
-        """Encode a BGR frame to JPEG bytes."""
-        quality = settings.STREAM_JPEG_QUALITY
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        if ok:
-            return buf.tobytes()
-        return None
+                time.sleep(sleep_time)
 
     def _release_capture(self) -> None:
         """Release the OpenCV VideoCapture."""
@@ -267,9 +316,8 @@ class StreamManager:
     ) -> CameraStream:
         if fps is None:
             fps = settings.STREAM_MAX_FPS
-        """Start streaming a camera. If already streaming, restart."""
+        """Start streaming a camera. If already streaming, return existing."""
         if camera_id in self._streams:
-            # Already running – return existing
             return self._streams[camera_id]
 
         stream = CameraStream(camera_id, rtsp_url, target_fps=fps)

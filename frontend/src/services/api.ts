@@ -112,6 +112,7 @@ export const modelsApi = {
     download: (modelName: string) => api.post('/models/download', { model_name: modelName }),
     getProgress: (modelId: string) => api.get(`/models/${modelId}/progress`),
     setDefault: (id: string) => api.put(`/models/${id}/default`),
+    merge: (name: string, modelIds: string[], selectedClasses: Record<string, string[]> = {}) => api.post('/models/merge', { name, model_ids: modelIds, selected_classes: selectedClasses }),
     upload: (file: File, name: string) => {
         const formData = new FormData();
         formData.append('file', file);
