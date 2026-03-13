@@ -107,7 +107,7 @@ async def get_embedding(text: str) -> Optional[List[float]]:
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
             resp = await client.post(
                 f"{base_url}/api/embed",
-                json={"model": EMBEDDING_MODEL, "input": text},
+                json={"model": EMBEDDING_MODEL, "input": text, "keep_alive": -1},
             )
             resp.raise_for_status()
             data = resp.json()

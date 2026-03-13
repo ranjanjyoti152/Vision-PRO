@@ -335,6 +335,7 @@ class LLMService:
                     "messages": messages,
                     "stream": False,
                     "think": False,
+                    "keep_alive": -1,
                 }
             )
             resp.raise_for_status()
@@ -360,6 +361,7 @@ class LLMService:
                     "model": model,
                     "messages": messages,
                     "stream": True,
+                    "keep_alive": -1,
                 },
             ) as resp:
                 resp.raise_for_status()
@@ -392,7 +394,8 @@ class LLMService:
                 json={
                     "model": vision_model,
                     "messages": messages,
-                    "stream": False
+                    "stream": False,
+                    "keep_alive": -1,
                 }
             )
             resp.raise_for_status()
