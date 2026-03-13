@@ -16,14 +16,17 @@ api.interceptors.request.use((config) => {
     return config;
 });
 
-// Response interceptor – handle 401
+// Response interceptor – handle 401 (skip for auth endpoints so login errors display properly)
 api.interceptors.response.use(
     (response) => response,
     (error) => {
         if (error.response?.status === 401) {
-            localStorage.removeItem('visionpro_token');
-            localStorage.removeItem('visionpro_user');
-            window.location.href = '/login';
+            const url = error.config?.url || '';
+            if (!url.includes('/auth/login') && !url.includes('/auth/signup')) {
+                localStorage.removeItem('visionpro_token');
+                localStorage.removeItem('visionpro_user');
+                window.location.href = '/login';
+            }
         }
         return Promise.reject(error);
     }

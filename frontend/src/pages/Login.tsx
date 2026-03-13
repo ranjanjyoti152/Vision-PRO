@@ -51,7 +51,10 @@ const Login: React.FC = () => {
             localStorage.setItem('visionpro_user', JSON.stringify(user));
             navigate('/');
         } catch (err: any) {
-            setError(err.response?.data?.detail || 'Authentication failed');
+            const msg = err.response?.data?.detail
+                || err.message
+                || 'Authentication failed. Please try again.';
+            setError(msg);
         } finally {
             setLoading(false);
         }
