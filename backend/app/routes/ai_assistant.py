@@ -1,11 +1,13 @@
 """
 AI Assistant routes – Chat with RAG (event context injection).
 """
+import json
 from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, Request
+from fastapi.responses import StreamingResponse
 from app.core.security import get_current_user
 from app.services.llm_service import llm_service
-from app.database import events_collection, cameras_collection
+from app.database import events_collection, cameras_collection, chat_history_collection
 from app.config import settings
 import re
 import logging
@@ -91,21 +93,7 @@ async def _fetch_event_context(user_msg: str, base_url: str) -> dict:
             hour_key = ts.strftime("%H:00")
             hourly_counts[hour_key] = hourly_counts.get(hour_key, 0) + 1
 
-    # Get the 20 most recent events with details
-    for evt in events[:20]:
-        snapshot = evt.get("snapshot_path", "")
-        snapshot_url = f"{base_url}{snapshot}" if snapshot else ""
-        recent_events.append({
-            "time": evt.get("timestamp", "").strftime("%Y-%m-%d %H:%M:%S") if evt.get("timestamp") else "",
-            "type": evt.get("event_type", ""),
-            "confidence": round(evt.get("confidence", 0), 2),
-            "camera_id": evt.get("camera_id", ""),
-            "summary": evt.get("ai_summary", ""),
-            "snapshot_url": snapshot_url,
-            "video_clip_url": f"{base_url}{evt.get('video_clip_path', '')}" if evt.get("video_clip_path") else "",
-        })
-
-    # Get camera names
+    # Get camera names (resolve before building recent_events)
     camera_names = {}
     if camera_counts:
         cam_ids = list(camera_counts.keys())
@@ -115,6 +103,21 @@ async def _fetch_event_context(user_msg: str, base_url: str) -> dict:
         )
         async for cam in cam_cursor:
             camera_names[str(cam["_id"])] = cam.get("name", str(cam["_id"]))
+
+    # Get the 20 most recent events with details
+    for evt in events[:20]:
+        snapshot = evt.get("snapshot_path", "")
+        snapshot_url = f"{base_url}{snapshot}" if snapshot else ""
+        cam_id = evt.get("camera_id", "")
+        recent_events.append({
+            "time": evt.get("timestamp", "").strftime("%Y-%m-%d %H:%M:%S") if evt.get("timestamp") else "",
+            "type": evt.get("event_type", ""),
+            "confidence": round(evt.get("confidence", 0), 2),
+            "camera": camera_names.get(cam_id, cam_id),
+            "summary": evt.get("ai_summary", ""),
+            "snapshot_url": snapshot_url,
+            "video_clip_url": f"{base_url}{evt.get('video_clip_path', '')}" if evt.get("video_clip_path") else "",
+        })
 
     # Build camera stats with names
     camera_stats = {}
@@ -184,7 +187,7 @@ def _build_system_prompt(context: dict) -> str:
             video_info = f" | Video: {evt['video_clip_url']}" if evt.get('video_clip_url') else ""
             lines.append(
                 f"- [{evt['time']}] {evt['type']} (conf: {evt['confidence']}) "
-                f"on camera {evt['camera_id']}: {evt['summary']}{snapshot_info}{video_info}"
+                f"on camera {evt['camera']}: {evt['summary']}{snapshot_info}{video_info}"
             )
 
     return "\n".join(lines)
@@ -236,13 +239,123 @@ async def chat(
     }
 
 
+@router.post("/chat/stream")
+async def chat_stream(
+    message: dict,
+    request: Request,
+    user: dict = Depends(get_current_user),
+):
+    """Stream AI assistant response via Server-Sent Events."""
+    user_msg = message.get("message", "")
+    if not user_msg:
+        async def empty():
+            yield f"data: {json.dumps({'type': 'content', 'text': 'Please provide a message.'})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'text': ''})}\n\n"
+        return StreamingResponse(empty(), media_type="text/event-stream")
+
+    base_url = str(request.base_url).rstrip('/')
+
+    try:
+        context = await _fetch_event_context(user_msg, base_url)
+        system_prompt = _build_system_prompt(context)
+    except Exception as e:
+        logger.error(f"Failed to fetch event context: {e}")
+        context = {"total_events": 0, "type_breakdown": {}, "camera_breakdown": {}, "recent_events": []}
+        system_prompt = (
+            "You are an AI security assistant for Vision Pro NVR. "
+            "The event database is temporarily unavailable. "
+            "Answer based on your general knowledge."
+        )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg},
+    ]
+
+    user_id = str(user.get("_id", ""))
+
+    async def event_generator():
+        # Send context metadata first
+        ctx_data = {
+            'total_events': context.get('total_events', 0),
+            'time_range': context.get('time_range', ''),
+            'type_breakdown': context.get('type_breakdown', {}),
+        }
+        yield f"data: {json.dumps({'type': 'context', 'text': '', 'context': ctx_data})}\n\n"
+
+        acc_content = ""
+        acc_thinking = ""
+        async for chunk in llm_service.chat_stream(messages):
+            if chunk["type"] == "thinking":
+                acc_thinking += chunk["text"]
+            elif chunk["type"] == "content":
+                acc_content += chunk["text"]
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+        # Save to chat history after streaming completes
+        try:
+            now = datetime.now(timezone.utc)
+            await chat_history_collection().insert_many([
+                {
+                    "user_id": user_id,
+                    "role": "user",
+                    "content": user_msg,
+                    "timestamp": now,
+                },
+                {
+                    "user_id": user_id,
+                    "role": "assistant",
+                    "content": acc_content,
+                    "thinking": acc_thinking if acc_thinking else None,
+                    "context": ctx_data,
+                    "timestamp": now,
+                },
+            ])
+        except Exception as e:
+            logger.warning(f"Failed to save chat history: {e}")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @router.get("/history")
 async def get_chat_history(
     page: int = 1,
-    page_size: int = 20,
+    page_size: int = 50,
     user: dict = Depends(get_current_user),
 ):
-    """Get AI assistant chat history."""
-    # TODO: Implement with chat_history collection
-    return {"messages": [], "total": 0}
+    """Get AI assistant chat history for the current user."""
+    user_id = str(user.get("_id", ""))
+    skip = (page - 1) * page_size
 
+    total = await chat_history_collection().count_documents({"user_id": user_id})
+
+    cursor = chat_history_collection().find(
+        {"user_id": user_id}
+    ).sort("timestamp", 1).skip(skip).limit(page_size)
+
+    docs = await cursor.to_list(length=page_size)
+
+    messages = []
+    for doc in docs:
+        msg = {
+            "role": doc.get("role", "user"),
+            "content": doc.get("content", ""),
+            "timestamp": doc.get("timestamp", "").isoformat() if doc.get("timestamp") else "",
+        }
+        if doc.get("thinking"):
+            msg["thinking"] = doc["thinking"]
+        if doc.get("context"):
+            msg["context"] = doc["context"]
+        messages.append(msg)
+
+    return {"messages": messages, "total": total, "page": page, "page_size": page_size}
+
+
+@router.delete("/history")
+async def clear_chat_history(
+    user: dict = Depends(get_current_user),
+):
+    """Clear all chat history for the current user."""
+    user_id = str(user.get("_id", ""))
+    result = await chat_history_collection().delete_many({"user_id": user_id})
+    return {"message": "Chat history cleared", "deleted": result.deleted_count}

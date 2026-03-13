@@ -741,6 +741,7 @@ class DetectionWorker:
             confidence=confidence,
             objects=[obj.model_dump(by_alias=True) for obj in detected_objs],
             face_name=face_name,
+            snapshot_path=str(snapshot_abs_path),
         )
         
         # 5. Dispatch Notifications (fire and forget)

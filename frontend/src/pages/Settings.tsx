@@ -103,7 +103,7 @@ const Settings: React.FC = () => {
 
     const [llm, setLlm] = useState({
         active_provider: '' as string,
-        ollama_enabled: false, ollama_base_url: 'http://localhost:11434', ollama_default_model: '',
+        ollama_enabled: false, ollama_base_url: 'http://localhost:11434', ollama_default_model: '', ollama_vision_model: '',
         openai_enabled: false, openai_api_key: '', openai_base_url: 'https://api.openai.com/v1', openai_default_model: 'gpt-4o',
         gemini_enabled: false, gemini_api_key: '', gemini_default_model: 'gemini-2.0-flash',
         openrouter_enabled: false, openrouter_api_key: '', openrouter_default_model: '',
@@ -161,7 +161,7 @@ const Settings: React.FC = () => {
         try {
             await settingsApi.updateLLM({
                 active_provider: llm.active_provider || null,
-                ollama: { enabled: llm.ollama_enabled, base_url: llm.ollama_base_url, default_model: llm.ollama_default_model },
+                ollama: { enabled: llm.ollama_enabled, base_url: llm.ollama_base_url, default_model: llm.ollama_default_model, vision_model: llm.ollama_vision_model },
                 openai: { enabled: llm.openai_enabled, api_key: llm.openai_api_key, base_url: llm.openai_base_url, default_model: llm.openai_default_model },
                 gemini: { enabled: llm.gemini_enabled, api_key: llm.gemini_api_key, default_model: llm.gemini_default_model },
                 openrouter: { enabled: llm.openrouter_enabled, api_key: llm.openrouter_api_key, default_model: llm.openrouter_default_model },
@@ -393,7 +393,12 @@ const Settings: React.FC = () => {
                                     <TextField fullWidth size="small" label="Base URL" value={llm.ollama_base_url}
                                         onChange={e => setLlm(l => ({ ...l, ollama_base_url: e.target.value }))} />
                                     <ModelSelector provider="ollama" value={llm.ollama_default_model}
-                                        onChange={v => setLlm(l => ({ ...l, ollama_default_model: v }))} />
+                                        onChange={v => setLlm(l => ({ ...l, ollama_default_model: v }))} label="Chat Model (Assistant)" />
+                                    <ModelSelector provider="ollama" value={llm.ollama_vision_model}
+                                        onChange={v => setLlm(l => ({ ...l, ollama_vision_model: v }))} label="Vision Model (Summaries)" />
+                                    <Typography variant="caption" color="text.secondary" sx={{ mt: -1 }}>
+                                        Select a vision-capable model (e.g. llava, moondream, qwen3-vl) for AI event summaries with scene analysis
+                                    </Typography>
                                 </>)}
                             </Stack>
                         </SectionCard>

@@ -142,7 +142,45 @@ export const analyticsApi = {
 // --- AI Assistant API ---
 export const assistantApi = {
     chat: (message: string) => api.post('/assistant/chat', { message }),
-    history: (params?: any) => api.get('/assistant/history', { params }),
+    chatStream: (message: string, onChunk: (data: { type: string; text: string; context?: any }) => void): { cancel: () => void } => {
+        const controller = new AbortController();
+        const token = localStorage.getItem('visionpro_token') || '';
+        fetch('/api/assistant/chat/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            body: JSON.stringify({ message }),
+            signal: controller.signal,
+        }).then(async (resp) => {
+            if (!resp.ok) { onChunk({ type: 'error', text: `HTTP ${resp.status}` }); onChunk({ type: 'done', text: '' }); return; }
+            const reader = resp.body?.getReader();
+            if (!reader) { onChunk({ type: 'error', text: 'No stream' }); onChunk({ type: 'done', text: '' }); return; }
+            const decoder = new TextDecoder();
+            let buf = '';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += decoder.decode(value, { stream: true });
+                const lines = buf.split('\n');
+                buf = lines.pop() || '';
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        try { onChunk(JSON.parse(line.slice(6))); } catch { /* skip */ }
+                    }
+                }
+            }
+            if (buf.startsWith('data: ')) {
+                try { onChunk(JSON.parse(buf.slice(6))); } catch { /* skip */ }
+            }
+        }).catch((err) => {
+            if (err.name !== 'AbortError') {
+                onChunk({ type: 'error', text: err.message || 'Connection failed' });
+                onChunk({ type: 'done', text: '' });
+            }
+        });
+        return { cancel: () => controller.abort() };
+    },
+    history: (page?: number, pageSize?: number) => api.get('/assistant/history', { params: { page, page_size: pageSize } }),
+    clearHistory: () => api.delete('/assistant/history'),
 };
 
 // --- Heatmaps API ---

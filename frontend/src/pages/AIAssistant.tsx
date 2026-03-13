@@ -1,12 +1,13 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
     Box, Typography, TextField, IconButton, Paper, Avatar,
-    CircularProgress, Tooltip, Fade, Grow,
+    CircularProgress, Tooltip, Fade, Grow, Collapse,
 } from '@mui/material';
 import {
     Send, SmartToy, Person, DeleteSweep, ContentCopy,
     AutoAwesome, SecurityOutlined, Analytics, AccessTime,
     DirectionsCar, Face, CameraAlt, TrendingUp,
+    Psychology, ExpandMore, ExpandLess,
 } from '@mui/icons-material';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -18,12 +19,14 @@ import { assistantApi } from '../services/api';
 interface Message {
     role: 'user' | 'assistant' | 'system';
     content: string;
+    thinking?: string;
     timestamp: Date;
     context?: {
         total_events?: number;
         time_range?: string;
         type_breakdown?: Record<string, number>;
     };
+    isStreaming?: boolean;
 }
 
 /* ── suggested prompts ───────────────────────────────────────────── */
@@ -136,6 +139,53 @@ const TypingIndicator = () => (
     </Box>
 );
 
+/* ── Thinking block (collapsible) ────────────────────────────────── */
+
+const ThinkingBlock: React.FC<{ thinking: string; isStreaming?: boolean }> = ({ thinking, isStreaming }) => {
+    const [expanded, setExpanded] = useState(false);
+    if (!thinking) return null;
+    return (
+        <Box sx={{ mb: 1.5 }}>
+            <Box
+                onClick={() => setExpanded(!expanded)}
+                sx={{
+                    display: 'flex', alignItems: 'center', gap: 0.5, cursor: 'pointer',
+                    px: 1, py: 0.5, borderRadius: 1.5,
+                    background: 'rgba(124,77,255,0.06)',
+                    border: '1px solid rgba(124,77,255,0.12)',
+                    transition: 'all 0.2s',
+                    '&:hover': { background: 'rgba(124,77,255,0.1)', borderColor: 'rgba(124,77,255,0.2)' },
+                }}
+            >
+                <Psychology sx={{ fontSize: 14, color: '#B388FF' }} />
+                <Typography variant="caption" sx={{ fontSize: '0.68rem', fontWeight: 600, color: '#B388FF', flex: 1 }}>
+                    {isStreaming ? 'Thinking...' : 'Thought process'}
+                </Typography>
+                {isStreaming && <CircularProgress size={10} sx={{ color: '#B388FF' }} />}
+                {expanded ? <ExpandLess sx={{ fontSize: 14, color: '#B388FF' }} /> : <ExpandMore sx={{ fontSize: 14, color: '#B388FF' }} />}
+            </Box>
+            <Collapse in={expanded}>
+                <Box sx={{
+                    mt: 0.5, px: 1.5, py: 1, borderRadius: 1.5,
+                    background: 'rgba(124,77,255,0.03)',
+                    border: '1px solid rgba(124,77,255,0.08)',
+                    borderTop: 'none',
+                    maxHeight: 200, overflow: 'auto',
+                    '&::-webkit-scrollbar': { width: 3 },
+                    '&::-webkit-scrollbar-thumb': { background: 'rgba(124,77,255,0.15)', borderRadius: 3 },
+                }}>
+                    <Typography variant="caption" sx={{
+                        whiteSpace: 'pre-wrap', fontSize: '0.68rem', lineHeight: 1.6,
+                        color: 'rgba(179,136,255,0.6)', fontFamily: 'monospace',
+                    }}>
+                        {thinking}
+                    </Typography>
+                </Box>
+            </Collapse>
+        </Box>
+    );
+};
+
 /* ── Context badge ───────────────────────────────────────────────── */
 
 const ContextBadge: React.FC<{ context?: Message['context'] }> = ({ context }) => {
@@ -163,24 +213,50 @@ const ContextBadge: React.FC<{ context?: Message['context'] }> = ({ context }) =
 
 /* ── component ───────────────────────────────────────────────────── */
 
+const WELCOME_MSG: Message = {
+    role: 'assistant',
+    content: 'Hello! I\'m your **AI security assistant** powered by real-time event data. I can:\n\n- 📊 **Analyze events** — summaries, trends, and breakdowns\n- 📷 **Show snapshots** — view event photos directly in chat\n- 🔍 **Query cameras** — activity per camera\n- ⏰ **Time-based queries** — "last hour", "today", "this week"\n\nPick a suggestion below or ask anything! 👇',
+    timestamp: new Date(),
+};
+
 const AIAssistant: React.FC = () => {
-    const [messages, setMessages] = useState<Message[]>([
-        {
-            role: 'assistant',
-            content: 'Hello! I\'m your **AI security assistant** powered by real-time event data. I can:\n\n- 📊 **Analyze events** — summaries, trends, and breakdowns\n- 📷 **Show snapshots** — view event photos directly in chat\n- 🔍 **Query cameras** — activity per camera\n- ⏰ **Time-based queries** — "last hour", "today", "this week"\n\nPick a suggestion below or ask anything! 👇',
-            timestamp: new Date()
-        }
-    ]);
+    const [messages, setMessages] = useState<Message[]>([WELCOME_MSG]);
     const [input, setInput] = useState('');
     const [loading, setLoading] = useState(false);
+    const [historyLoaded, setHistoryLoaded] = useState(false);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLInputElement>(null);
+    const cancelRef = useRef<{ cancel: () => void } | null>(null);
 
     const scrollToBottom = useCallback(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, []);
 
     useEffect(() => { scrollToBottom(); }, [messages, loading, scrollToBottom]);
+
+    // Load chat history on mount
+    useEffect(() => {
+        (async () => {
+            try {
+                const res = await assistantApi.history(1, 200);
+                const history = res.data?.messages || [];
+                if (history.length > 0) {
+                    const loaded: Message[] = [WELCOME_MSG];
+                    for (const m of history) {
+                        loaded.push({
+                            role: m.role,
+                            content: m.content || '',
+                            thinking: m.thinking || '',
+                            timestamp: m.timestamp ? new Date(m.timestamp) : new Date(),
+                            context: m.context,
+                        });
+                    }
+                    setMessages(loaded);
+                }
+            } catch { /* ignore */ }
+            setHistoryLoaded(true);
+        })();
+    }, []);
 
     const handleSend = async (text?: string) => {
         const msg = (text || input).trim();
@@ -191,36 +267,89 @@ const AIAssistant: React.FC = () => {
         setMessages(prev => [...prev, userMsg]);
         setLoading(true);
 
-        try {
-            const res = await assistantApi.chat(msg);
-            const assistantMsg: Message = {
-                role: 'assistant',
-                content: res.data.response || 'No response received.',
-                timestamp: new Date(),
-                context: res.data.context,
-            };
-            setMessages(prev => [...prev, assistantMsg]);
-        } catch {
-            setMessages(prev => [...prev, {
-                role: 'assistant',
-                content: '⚠️ **Connection Error**\n\nCouldn\'t reach the AI service. Please verify:\n- LLM provider is configured in **Settings**\n- API key is valid\n- Backend server is running',
-                timestamp: new Date(),
-            }]);
-        }
-        setLoading(false);
-        inputRef.current?.focus();
+        // Create a placeholder assistant message for streaming
+        const streamMsgId = Date.now();
+        const streamMsg: Message = {
+            role: 'assistant',
+            content: '',
+            thinking: '',
+            timestamp: new Date(),
+            isStreaming: true,
+        };
+        setMessages(prev => [...prev, streamMsg]);
+
+        let accContent = '';
+        let accThinking = '';
+        let accContext: Message['context'] | undefined;
+
+        cancelRef.current = assistantApi.chatStream(msg, (chunk) => {
+            if (chunk.type === 'context') {
+                accContext = chunk.context;
+                setMessages(prev => {
+                    const msgs = [...prev];
+                    const last = msgs[msgs.length - 1];
+                    if (last.role === 'assistant' && last.isStreaming) {
+                        msgs[msgs.length - 1] = { ...last, context: accContext };
+                    }
+                    return msgs;
+                });
+            } else if (chunk.type === 'thinking') {
+                accThinking += chunk.text;
+                setMessages(prev => {
+                    const msgs = [...prev];
+                    const last = msgs[msgs.length - 1];
+                    if (last.role === 'assistant' && last.isStreaming) {
+                        msgs[msgs.length - 1] = { ...last, thinking: accThinking };
+                    }
+                    return msgs;
+                });
+            } else if (chunk.type === 'content') {
+                accContent += chunk.text;
+                setMessages(prev => {
+                    const msgs = [...prev];
+                    const last = msgs[msgs.length - 1];
+                    if (last.role === 'assistant' && last.isStreaming) {
+                        msgs[msgs.length - 1] = { ...last, content: accContent };
+                    }
+                    return msgs;
+                });
+            } else if (chunk.type === 'error') {
+                accContent += chunk.text;
+                setMessages(prev => {
+                    const msgs = [...prev];
+                    const last = msgs[msgs.length - 1];
+                    if (last.role === 'assistant' && last.isStreaming) {
+                        msgs[msgs.length - 1] = { ...last, content: accContent || '⚠️ Error communicating with AI.' };
+                    }
+                    return msgs;
+                });
+            } else if (chunk.type === 'done') {
+                setMessages(prev => {
+                    const msgs = [...prev];
+                    const last = msgs[msgs.length - 1];
+                    if (last.role === 'assistant' && last.isStreaming) {
+                        msgs[msgs.length - 1] = {
+                            ...last,
+                            isStreaming: false,
+                            content: accContent || 'No response received.',
+                        };
+                    }
+                    return msgs;
+                });
+                setLoading(false);
+                cancelRef.current = null;
+                inputRef.current?.focus();
+            }
+        });
     };
 
-    const clearChat = () => {
-        setMessages([{
-            role: 'assistant',
-            content: '🔄 Chat cleared. Ready for new questions!',
-            timestamp: new Date(),
-        }]);
+    const clearChat = async () => {
+        try { await assistantApi.clearHistory(); } catch { /* ignore */ }
+        setMessages([WELCOME_MSG]);
     };
 
     const formatTime = (d: Date) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const showSuggestions = messages.length <= 2 && !loading;
+    const showSuggestions = messages.length <= 1 && !loading && historyLoaded;
 
     return (
         <Box sx={{ height: 'calc(100vh - 100px)', display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -304,7 +433,10 @@ const AIAssistant: React.FC = () => {
                                         '&:hover': { borderColor: msg.role === 'user' ? 'rgba(79,142,247,0.3)' : 'rgba(148,163,184,0.12)' },
                                     }}>
                                         {msg.role === 'assistant' ? (
-                                            <MarkdownContent content={msg.content} />
+                                            <>
+                                                <ThinkingBlock thinking={msg.thinking || ''} isStreaming={msg.isStreaming && !msg.content} />
+                                                <MarkdownContent content={msg.content + (msg.isStreaming ? '▍' : '')} />
+                                            </>
                                         ) : (
                                             <Typography variant="body2" sx={{ lineHeight: 1.75, color: 'rgba(255,255,255,0.92)' }}>{msg.content}</Typography>
                                         )}
@@ -321,29 +453,6 @@ const AIAssistant: React.FC = () => {
                             </Box>
                         </Grow>
                     ))}
-
-                    {/* Typing indicator */}
-                    {loading && (
-                        <Fade in>
-                            <Box sx={{ display: 'flex', gap: 1.5, alignItems: 'flex-start' }}>
-                                <Avatar sx={{
-                                    width: 34, height: 34,
-                                    background: 'linear-gradient(135deg, #7C4DFF, #651FFF)',
-                                    boxShadow: '0 2px 10px rgba(124,77,255,0.25)',
-                                    border: '2px solid rgba(255,255,255,0.06)',
-                                }}>
-                                    <AutoAwesome sx={{ fontSize: 18 }} />
-                                </Avatar>
-                                <Paper elevation={0} sx={{
-                                    p: 1.5, background: 'rgba(255,255,255,0.025)',
-                                    border: '1px solid rgba(148,163,184,0.06)',
-                                    borderRadius: '18px 18px 18px 4px',
-                                }}>
-                                    <TypingIndicator />
-                                </Paper>
-                            </Box>
-                        </Fade>
-                    )}
 
                     <div ref={messagesEndRef} />
                 </Box>
@@ -462,6 +571,10 @@ const AIAssistant: React.FC = () => {
                 @keyframes pulse {
                     0%, 100% { opacity: 1; }
                     50% { opacity: 0.5; }
+                }
+                @keyframes blink {
+                    0%, 50% { opacity: 1; }
+                    51%, 100% { opacity: 0; }
                 }
             `}</style>
         </Box>

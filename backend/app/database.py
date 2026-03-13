@@ -80,6 +80,10 @@ def ai_models_collection():
     return get_collection("ai_models")
 
 
+def chat_history_collection():
+    return get_collection("chat_history")
+
+
 def users_collection():
     return get_collection("users")
 

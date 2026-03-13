@@ -4,6 +4,7 @@ Supports multiple providers: Ollama, OpenAI, Gemini, OpenRouter.
 """
 import asyncio
 import logging
+import base64
 import httpx
 from typing import Dict, Any, List, Optional
 from app.database import settings_collection
@@ -49,7 +50,8 @@ class LLMService:
                 face_name = job.get("face_name")
 
                 ai_summary = await self.generate_event_summary(
-                    event_type, confidence, objects, face_name
+                    event_type, confidence, objects, face_name,
+                    snapshot_path=job.get("snapshot_path"),
                 )
                 if ai_summary and ai_summary not in ("Event detected.", ""):
                     from app.database import events_collection
@@ -64,7 +66,7 @@ class LLMService:
             finally:
                 self._queue.task_done()
 
-    def enqueue_summary(self, event_oid, event_type, confidence, objects, face_name=None):
+    def enqueue_summary(self, event_oid, event_type, confidence, objects, face_name=None, snapshot_path=None):
         """Add a summary job to the queue. Drops silently if queue is full."""
         self._ensure_queue()
         try:
@@ -74,6 +76,7 @@ class LLMService:
                 "confidence": confidence,
                 "objects": objects,
                 "face_name": face_name,
+                "snapshot_path": snapshot_path,
             })
             logger.info(f"📝 Queued summary for {event_type} event (pending: {self._queue.qsize()})")
         except asyncio.QueueFull:
@@ -95,8 +98,8 @@ class LLMService:
             settings[key] = value
         return settings
 
-    async def generate_event_summary(self, event_type: EventType, confidence: float, objects: List[Dict], face_name: Optional[str] = None) -> str:
-        """Generate a concise 1-sentence summary of an event."""
+    async def generate_event_summary(self, event_type: EventType, confidence: float, objects: List[Dict], face_name: Optional[str] = None, snapshot_path: Optional[str] = None) -> str:
+        """Generate a concise 1-sentence summary of an event, with optional image analysis."""
 
         # Build a descriptive context
         objects_str = ", ".join([
@@ -106,18 +109,38 @@ class LLMService:
         if not objects_str:
             objects_str = "no specific objects"
 
-        prompt = (
-            f"Summarize this security camera event in one professional sentence:\n"
-            f"• Event type: {event_type.value}\n"
-            f"• Detection confidence: {confidence:.0%}\n"
-            f"• Objects detected: {objects_str}\n"
-        )
-        if face_name:
-            prompt += f"• Known individual identified: {face_name}\n"
+        # Load snapshot image if available
+        image_b64 = None
+        if snapshot_path:
+            try:
+                import os
+                if os.path.exists(snapshot_path):
+                    with open(snapshot_path, "rb") as f:
+                        image_b64 = base64.b64encode(f.read()).decode("utf-8")
+            except Exception as e:
+                logger.warning(f"Failed to load snapshot for summary: {e}")
 
-        prompt += "\nProvide ONLY the summary sentence."
+        if image_b64:
+            prompt = (
+                f"Analyze this security camera snapshot and describe what you see in one professional sentence.\n"
+                f"Context: Event type is '{event_type.value}', confidence {confidence:.0%}.\n"
+                f"Detected objects: {objects_str}\n"
+            )
+            if face_name:
+                prompt += f"Known individual identified: {face_name}\n"
+            prompt += "\nDescribe the ACTUAL scene — what's happening, who/what is visible, the setting. Output ONLY the summary sentence."
+        else:
+            prompt = (
+                f"Summarize this security camera event in one professional sentence:\n"
+                f"• Event type: {event_type.value}\n"
+                f"• Detection confidence: {confidence:.0%}\n"
+                f"• Objects detected: {objects_str}\n"
+            )
+            if face_name:
+                prompt += f"• Known individual identified: {face_name}\n"
+            prompt += "\nProvide ONLY the summary sentence."
 
-        return await self._generate_text(prompt, fallback="Event detected.")
+        return await self._generate_text(prompt, fallback="Event detected.", image_b64=image_b64)
 
     async def chat(self, messages: List[Dict[str, str]]) -> str:
         """Handle a chat conversation with the AI Assistant."""
@@ -136,8 +159,39 @@ class LLMService:
             logger.error(f"Chat error: {e}")
             return f"Error communicating with AI: {str(e)}"
 
-    async def _generate_text(self, prompt: str, fallback: str) -> str:
-        """Internal helper to call the active LLM with a single prompt."""
+    async def chat_stream(self, messages: List[Dict[str, str]]):
+        """Stream chat response as async generator yielding SSE-formatted chunks.
+        Yields dicts: {"type": "thinking"|"content"|"done"|"error", "text": "..."}
+        """
+        if not messages:
+            yield {"type": "content", "text": "How can I help you?"}
+            yield {"type": "done", "text": ""}
+            return
+
+        try:
+            settings = await self._get_llm_settings()
+            provider = settings.get("active_provider")
+
+            if not provider:
+                yield {"type": "content", "text": "AI Assistant is not configured. Please set up an LLM provider in Settings."}
+                yield {"type": "done", "text": ""}
+                return
+
+            if provider == "ollama":
+                async for chunk in self._stream_ollama(settings, messages):
+                    yield chunk
+            else:
+                # Non-streaming fallback for other providers
+                result = await self._call_provider(provider, settings, messages)
+                yield {"type": "content", "text": result}
+                yield {"type": "done", "text": ""}
+        except Exception as e:
+            logger.error(f"Chat stream error: {e}")
+            yield {"type": "error", "text": f"Error communicating with AI: {str(e)}"}
+            yield {"type": "done", "text": ""}
+
+    async def _generate_text(self, prompt: str, fallback: str, image_b64: Optional[str] = None) -> str:
+        """Internal helper to call the active LLM with a single prompt, optionally with an image."""
         provider = "unknown"
         try:
             settings = await self._get_llm_settings()
@@ -147,15 +201,27 @@ class LLMService:
                 logger.warning("⚠️ No LLM provider configured — using fallback summary")
                 return fallback
 
+            # Use separate vision model for image-based summaries (Ollama)
+            if image_b64 and provider == "ollama":
+                vision_model = settings.get("ollama_vision_model", "")
+                if vision_model:
+                    logger.info(f"🤖 Calling ollama/{vision_model} (vision) for event summary")
+                    messages = self._build_vision_messages(provider, prompt, image_b64)
+                    result = await self._call_ollama_vision(settings, messages, vision_model)
+                    return result.strip() if result else fallback
+
             model_key = f"{provider}_default_model"
             model = settings.get(model_key, "unknown")
-            logger.info(f"🤖 Calling {provider}/{model} for event summary")
+            logger.info(f"🤖 Calling {provider}/{model} for event summary (vision={'yes' if image_b64 else 'no'})")
 
-            # Use system + user message for higher quality output
-            messages = [
-                {"role": "system", "content": _SUMMARY_SYSTEM},
-                {"role": "user", "content": prompt},
-            ]
+            # Build messages with optional image
+            if image_b64:
+                messages = self._build_vision_messages(provider, prompt, image_b64)
+            else:
+                messages = [
+                    {"role": "system", "content": _SUMMARY_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ]
             result = await self._call_provider(provider, settings, messages)
             return result.strip() if result else fallback
 
@@ -170,7 +236,7 @@ class LLMService:
             logger.error(f"❌ Failed to generate LLM summary ({provider}): {err_msg}")
             return fallback
 
-    async def _call_provider(self, provider: str, settings: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
+    async def _call_provider(self, provider: str, settings: Dict[str, Any], messages: list) -> str:
         """Route the request to the specific provider's API."""
         if provider == "ollama":
             return await self._call_ollama(settings, messages)
@@ -183,15 +249,102 @@ class LLMService:
         else:
             raise ValueError(f"Unknown LLM provider: {provider}")
 
+    def _build_vision_messages(self, provider: str, prompt: str, image_b64: str) -> list:
+        """Build provider-appropriate messages containing text + image."""
+        if provider == "gemini":
+            # Gemini uses a special format handled in _call_gemini
+            return [
+                {"role": "system", "content": _SUMMARY_SYSTEM},
+                {"role": "user", "content": prompt, "_image_b64": image_b64},
+            ]
+        elif provider == "ollama":
+            # Ollama uses 'images' array with raw base64 strings
+            return [
+                {"role": "system", "content": _SUMMARY_SYSTEM},
+                {"role": "user", "content": prompt, "images": [image_b64]},
+            ]
+        else:
+            # OpenAI / OpenRouter use content array format
+            return [
+                {"role": "system", "content": _SUMMARY_SYSTEM},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                        {"type": "text", "text": prompt},
+                    ],
+                },
+            ]
+
     async def _call_ollama(self, settings: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
         base_url = settings.get("ollama_base_url", "http://localhost:11434").rstrip("/")
         model = settings.get("ollama_default_model", "llama3")
+        ollama_timeout = httpx.Timeout(120.0, connect=10.0)
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
+        async with httpx.AsyncClient(timeout=ollama_timeout) as client:
             resp = await client.post(
                 f"{base_url}/api/chat",
                 json={
                     "model": model,
+                    "messages": messages,
+                    "stream": False,
+                    "think": False,
+                }
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data.get("message", {})
+            content = msg.get("content", "")
+            if not content:
+                content = msg.get("thinking", "")
+            return content
+
+    async def _stream_ollama(self, settings: Dict[str, Any], messages: list):
+        """Stream Ollama chat response, yielding thinking and content chunks."""
+        import json as _json
+        base_url = settings.get("ollama_base_url", "http://localhost:11434").rstrip("/")
+        model = settings.get("ollama_default_model", "llama3")
+        ollama_timeout = httpx.Timeout(120.0, connect=10.0)
+
+        async with httpx.AsyncClient(timeout=ollama_timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{base_url}/api/chat",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "stream": True,
+                },
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        chunk = _json.loads(line)
+                    except _json.JSONDecodeError:
+                        continue
+                    msg = chunk.get("message", {})
+                    thinking = msg.get("thinking", "")
+                    content = msg.get("content", "")
+                    if thinking:
+                        yield {"type": "thinking", "text": thinking}
+                    if content:
+                        yield {"type": "content", "text": content}
+                    if chunk.get("done", False):
+                        yield {"type": "done", "text": ""}
+                        return
+
+    async def _call_ollama_vision(self, settings: Dict[str, Any], messages: list, vision_model: str) -> str:
+        """Call Ollama with a dedicated vision model for image analysis."""
+        base_url = settings.get("ollama_base_url", "http://localhost:11434").rstrip("/")
+        vision_timeout = httpx.Timeout(120.0, connect=10.0)
+
+        async with httpx.AsyncClient(timeout=vision_timeout) as client:
+            resp = await client.post(
+                f"{base_url}/api/chat",
+                json={
+                    "model": vision_model,
                     "messages": messages,
                     "stream": False
                 }
@@ -223,7 +376,7 @@ class LLMService:
             data = resp.json()
             return data["choices"][0]["message"]["content"]
 
-    async def _call_gemini(self, settings: Dict[str, Any], messages: List[Dict[str, str]]) -> str:
+    async def _call_gemini(self, settings: Dict[str, Any], messages: list) -> str:
         api_key = settings.get("gemini_api_key", "")
         model = settings.get("gemini_default_model", "gemini-2.0-flash")
 
@@ -236,10 +389,24 @@ class LLMService:
                 system_text = msg["content"] + "\n\n"
                 continue
             role = "user" if msg["role"] == "user" else "model"
-            text = (system_text + msg["content"]) if system_text and role == "user" else msg["content"]
-            contents.append({"role": role, "parts": [{"text": text}]})
+            text = (system_text + msg.get("content", "")) if system_text and role == "user" else msg.get("content", "")
+            if isinstance(text, list):
+                # Multi-part content (vision) — skip, handled below
+                text = ""
+
+            parts = []
+            # Add image part if present
+            image_b64 = msg.get("_image_b64")
+            if image_b64:
+                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": image_b64}})
             if system_text and role == "user":
-                system_text = ""  # Only prepend once
+                parts.append({"text": system_text + (msg.get("content", "") if isinstance(msg.get("content"), str) else "")})
+                system_text = ""
+            elif text:
+                parts.append({"text": text})
+
+            if parts:
+                contents.append({"role": role, "parts": parts})
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
 

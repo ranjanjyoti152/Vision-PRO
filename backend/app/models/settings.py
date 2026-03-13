@@ -69,6 +69,7 @@ class OllamaConfig(BaseModel):
     enabled: bool = False
     base_url: str = "http://localhost:11434"
     default_model: str = ""
+    vision_model: str = ""
 
 
 class OpenAIConfig(BaseModel):
