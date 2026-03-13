@@ -435,7 +435,13 @@ async def set_default_model(
     if not settings.DEEPSTREAM_ENABLED:
         try:
             from app.workers.yolo_worker import detection_worker
-            await detection_worker.reload_model(pt_path)
+            if model["type"] == "merged":
+                await detection_worker.reload_merged_model(
+                    models=model["metadata"]["merged_models"],
+                    selected_classes=model["metadata"].get("selected_classes"),
+                )
+            else:
+                await detection_worker.reload_model(pt_path)
         except Exception as e:
             pass  # Non-critical for standard mode
 

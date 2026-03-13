@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     STREAM_MAX_FPS: int = 30
 
     # --- AI Detection ---
-    YOLO_INFERENCE_INTERVAL: float = 1.0
+    YOLO_INFERENCE_INTERVAL: float = 0.3
     EVENT_COOLDOWN_SECONDS: int = 15
 
     # --- DeepStream (GPU-native pipeline) ---

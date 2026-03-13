@@ -69,6 +69,105 @@ class YOLOEngine:
         return self.model.predict(frame, verbose=False, device=device)
 
 
+class MergedYOLOEngine:
+    """Runs multiple YOLO models simultaneously and merges their results."""
+
+    def __init__(self):
+        self.engines: list[YOLOEngine] = []
+        self.selected_classes: dict[str, list[str]] = {}  # model_id -> active class names
+        self.model_meta: list[dict] = []  # [{model_id, model_name, pt_path}, ...]
+
+    def load(self, models: list[dict], selected_classes: dict[str, list[str]] | None = None):
+        """Load all sub-models onto GPU."""
+        self.selected_classes = selected_classes or {}
+        self.model_meta = models
+        self.engines = []
+
+        for m in models:
+            pt_path = m.get("file_path", m.get("pt_path", ""))
+            if not pt_path or not os.path.exists(pt_path):
+                logger.warning(f"⚠️ Merged sub-model not found: {pt_path}, skipping")
+                continue
+            engine = YOLOEngine(model_name=os.path.basename(pt_path))
+            engine.load()
+            self.engines.append(engine)
+            logger.info(f"  ✅ Loaded merged sub-model: {m.get('name', os.path.basename(pt_path))}")
+
+        logger.info(f"🧩 MergedYOLOEngine ready — {len(self.engines)} models loaded")
+
+    def predict(self, frame: np.ndarray) -> list:
+        """Run all models on the frame and merge detections into a single result."""
+        if not self.engines:
+            return []
+
+        import torch
+
+        all_boxes = []
+        all_confs = []
+        all_cls_ids = []
+        merged_names: dict[int, str] = {}
+        class_offset = 0
+
+        for idx, engine in enumerate(self.engines):
+            results = engine.predict(frame)
+            if not results or not results[0].boxes:
+                class_offset += len(results[0].names) if results else 0
+                continue
+
+            r = results[0]
+            model_id = self.model_meta[idx].get("id", self.model_meta[idx].get("model_id", ""))
+            active_cls = self.selected_classes.get(model_id)
+
+            boxes = r.boxes.xyxy.cpu()
+            confs = r.boxes.conf.cpu()
+            cls_ids = r.boxes.cls.cpu()
+
+            for i in range(len(boxes)):
+                orig_cls = int(cls_ids[i])
+                class_name = r.names.get(orig_cls, f"class_{orig_cls}")
+
+                # Filter by selected classes if specified
+                if active_cls is not None and class_name not in active_cls:
+                    continue
+
+                remapped_id = class_offset + orig_cls
+                merged_names[remapped_id] = class_name
+                all_boxes.append(boxes[i])
+                all_confs.append(confs[i])
+                all_cls_ids.append(torch.tensor(remapped_id, dtype=torch.float32))
+
+            class_offset += len(r.names)
+
+        if not all_boxes:
+            return []
+
+        # Build a synthetic result object that _process_results can consume
+        merged = _MergedResult(
+            boxes=_MergedBoxes(
+                xyxy=torch.stack(all_boxes),
+                conf=torch.stack(all_confs),
+                cls=torch.stack(all_cls_ids),
+            ),
+            names=merged_names,
+        )
+        return [merged]
+
+
+class _MergedBoxes:
+    """Lightweight stand-in for ultralytics Boxes so _process_results works."""
+    def __init__(self, xyxy, conf, cls):
+        self.xyxy = xyxy
+        self.conf = conf
+        self.cls = cls
+
+
+class _MergedResult:
+    """Lightweight stand-in for ultralytics Results so _process_results works."""
+    def __init__(self, boxes, names):
+        self.boxes = boxes
+        self.names = names
+
+
 @dataclass
 class CooldownTracker:
     """Tracks last event time per camera per class to prevent log spam."""
@@ -117,15 +216,27 @@ class DetectionWorker:
             if os.path.exists(active_path):
                 with open(active_path) as f:
                     info = json.load(f)
-                pt_path = info.get("pt_path", "")
-                if pt_path and os.path.exists(pt_path):
-                    self.engine = YOLOEngine(model_name=os.path.basename(pt_path))
-                    logger.info(f"📋 Using active model from config: {pt_path}")
+
+                if info.get("is_merged") and "models" in info:
+                    # Merged model — load all sub-models simultaneously
+                    logger.info(f"🧩 Loading merged model: {info.get('model_name', 'merged')}")
+                    merged = MergedYOLOEngine()
+                    merged.load(
+                        models=info["models"],
+                        selected_classes=info.get("selected_classes"),
+                    )
+                    self.engine = merged
+                else:
+                    pt_path = info.get("pt_path", "")
+                    if pt_path and os.path.exists(pt_path):
+                        self.engine = YOLOEngine(model_name=os.path.basename(pt_path))
+                        logger.info(f"📋 Using active model from config: {pt_path}")
         except Exception as e:
             logger.warning(f"Could not read active_model.json, using default: {e}")
 
         # Load model synchronously first so we don't block the loop later
-        self.engine.load()
+        if isinstance(self.engine, YOLOEngine):
+            self.engine.load()
         from app.services.face_service import face_engine
         try:
             face_engine.load()
@@ -149,7 +260,7 @@ class DetectionWorker:
         logger.info("⏹ YOLO Detection Worker stopped")
 
     async def reload_model(self, model_path: str):
-        """Hot-swap the YOLO model without restarting the worker."""
+        """Hot-swap a single YOLO model without restarting the worker."""
         logger.info(f"🔄 Reloading YOLO model: {model_path}")
         try:
             new_engine = YOLOEngine(model_name=os.path.basename(model_path))
@@ -158,6 +269,18 @@ class DetectionWorker:
             logger.info(f"✅ YOLO model reloaded: {model_path}")
         except Exception as e:
             logger.error(f"❌ Failed to reload YOLO model: {e}")
+            raise
+
+    async def reload_merged_model(self, models: list[dict], selected_classes: dict | None = None):
+        """Hot-swap to a merged multi-model config without restarting the worker."""
+        logger.info(f"🔄 Reloading merged model ({len(models)} sub-models)")
+        try:
+            new_engine = MergedYOLOEngine()
+            await asyncio.to_thread(new_engine.load, models, selected_classes)
+            self.engine = new_engine
+            logger.info(f"✅ Merged model reloaded with {len(new_engine.engines)} sub-models")
+        except Exception as e:
+            logger.error(f"❌ Failed to reload merged model: {e}")
             raise
 
 
@@ -222,6 +345,11 @@ class DetectionWorker:
         config = cam.get("detection_config", {})
         target_classes = config.get("detection_classes", ["person", "vehicle", "animal"])
         threshold = config.get("confidence_threshold", 0.5)
+
+        # When using a merged model, skip the camera-level class filter entirely —
+        # the merge config already controls which classes each sub-model detects.
+        # Events are gated by ROI zone trigger_classes instead.
+        is_merged = isinstance(self.engine, MergedYOLOEngine)
         
         if cam_id not in self.cooldowns:
             self.cooldowns[cam_id] = CooldownTracker()
@@ -230,6 +358,7 @@ class DetectionWorker:
         detected_objs: list[DetectedObject] = []
         highest_conf_class = None
         highest_conf = 0.0
+        highest_conf_class_name = None
         primary_bbox = None
         
         # Parse boxes
@@ -249,8 +378,11 @@ class DetectionWorker:
             # Also accept raw class names for custom-trained models
             mapped_type = self._map_class_to_event_type(class_name)
             
-            if mapped_type.value not in target_classes and class_name not in target_classes:
-                continue
+            # For merged models, skip camera-level class filter (ROI zones gate events).
+            # For single models, apply the camera detection_classes filter.
+            if not is_merged:
+                if mapped_type.value not in target_classes and class_name not in target_classes:
+                    continue
 
             if float(conf) < threshold:
                 continue
@@ -267,6 +399,7 @@ class DetectionWorker:
             if conf > highest_conf:
                 highest_conf = float(conf)
                 highest_conf_class = mapped_type
+                highest_conf_class_name = class_name
                 primary_bbox = bbox
                 
         if not detected_objs:
@@ -364,16 +497,23 @@ class DetectionWorker:
                             )
 
         # ── ROI Zone Check (only gates event creation) ─────────────
-        roi_triggered = await self._check_roi_zones(cam_id, detected_objs, frame)
-        if not roi_triggered:
+        roi_trigger = await self._check_roi_zones(cam_id, detected_objs, frame)
+        if roi_trigger is None:
             return
 
-        if primary_bbox is None or highest_conf_class is None:
-            logger.warning(f"⚠️ ROI triggered on {cam_id} but primary_bbox or event_type is None — skipping event")
-            return
+        # Use the actual object that triggered the ROI zone for the event,
+        # not the highest-confidence object from the entire frame.
+        trigger_class_name = roi_trigger["class_name"]
+        trigger_event_type = roi_trigger["event_type"]
+        trigger_conf = roi_trigger["confidence"]
+        trigger_bbox = roi_trigger["bbox"]
+
+        # Override with face info if the triggering object was a person and face was recognized
+        if face_id and trigger_event_type == EventType.PERSON:
+            trigger_event_type = highest_conf_class  # FACE_KNOWN or FACE_UNKNOWN
 
         try:
-            await self._create_event(cam_id, highest_conf_class, highest_conf, primary_bbox, detected_objs, frame, result, face_id)
+            await self._create_event(cam_id, trigger_event_type, trigger_conf, trigger_bbox, detected_objs, frame, result, face_id, trigger_class_name)
         except Exception as e:
             logger.error(f"❌ Failed to create event for camera {cam_id}: {e}", exc_info=True)
 
@@ -417,14 +557,14 @@ class DetectionWorker:
             self._roi_cache_time = now
         return self._roi_cache.get(cam_id, [])
 
-    async def _check_roi_zones(self, cam_id: str, detected_objs: list, frame: np.ndarray) -> bool:
+    async def _check_roi_zones(self, cam_id: str, detected_objs: list, frame: np.ndarray) -> dict | None:
         """Check if any detected objects fall inside active ROI zones.
-        Returns True if at least one object triggered a zone, False otherwise.
+        Returns info about the triggering object if found, None otherwise.
         """
         import time as _time
         zones = await self._load_roi_zones(cam_id)
         if not zones:
-            return False
+            return None
 
         h, w = frame.shape[:2]
         now = _time.time()
@@ -485,9 +625,21 @@ class DetectionWorker:
                             )
                         except Exception as e:
                             logger.warning(f"ROI notification failed: {e}")
-                    return True  # At least one object triggered a zone
+                    # Return the triggering object info
+                    obj_bbox = obj.bbox
+                    if isinstance(obj_bbox, dict):
+                        trigger_bbox = BoundingBox(**obj_bbox)
+                    else:
+                        trigger_bbox = obj_bbox
+                    return {
+                        "class_name": obj_class,
+                        "event_type": mapped,
+                        "confidence": obj.confidence,
+                        "bbox": trigger_bbox,
+                        "zone_name": zone_name,
+                    }
 
-        return False  # No object triggered any zone
+        return None  # No object triggered any zone
 
     def _map_class_to_event_type(self, yolo_class: str) -> EventType:
         """Map raw COCO class names to generic internal event types."""
@@ -506,7 +658,8 @@ class DetectionWorker:
     async def _create_event(
         self, cam_id: str, event_type: EventType, confidence: float, 
         primary_bbox: BoundingBox, detected_objs: list[DetectedObject], 
-        raw_frame: np.ndarray, result, face_id: Optional[str] = None
+        raw_frame: np.ndarray, result, face_id: Optional[str] = None,
+        raw_class_name: Optional[str] = None
     ):
         """Save snapshot, generate the database event."""
         from app.database import events_collection
@@ -516,9 +669,23 @@ class DetectionWorker:
         # 1. Plot boxes on frame and save snapshot
         try:
             annotated_frame = result.plot()
-        except Exception as e:
-            logger.warning(f"result.plot() failed ({e}), using raw frame")
-            annotated_frame = raw_frame
+        except Exception:
+            # Merged results or plot failure — draw boxes manually
+            annotated_frame = raw_frame.copy()
+            if result.boxes is not None:
+                boxes_np = result.boxes.xyxy.cpu().numpy()
+                confs_np = result.boxes.conf.cpu().numpy()
+                cls_np = result.boxes.cls.cpu().numpy()
+                names = result.names
+                for box, conf, cls_id in zip(boxes_np, confs_np, cls_np):
+                    x1, y1, x2, y2 = map(int, box)
+                    label = names.get(int(cls_id), f"class_{int(cls_id)}")
+                    color = (0, 255, 0)
+                    cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+                    text = f"{label} {conf:.2f}"
+                    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                    cv2.rectangle(annotated_frame, (x1, y1 - th - 6), (x1 + tw, y1), color, -1)
+                    cv2.putText(annotated_frame, text, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
 
         snapshot_filename = f"{cam_id}_{event_uuid}.jpg"
         snapshot_abs_path = settings.SNAPSHOT_DIR / snapshot_filename
@@ -536,11 +703,16 @@ class DetectionWorker:
                 face_name = face_doc.get("name")
 
         now = datetime.now(timezone.utc)
-        default_summary = f"{event_type.value} detected" + (f" ({face_name})" if face_name else "")
+        display_label = raw_class_name if raw_class_name else event_type.value
+        default_summary = f"{display_label} detected" + (f" ({face_name})" if face_name else "")
         
+        # Use actual class name as event_type for custom detections
+        # so the UI badge shows "Ambulance", "Fire", etc. instead of "Custom"
+        stored_event_type = raw_class_name if event_type == EventType.CUSTOM and raw_class_name else event_type.value
+
         event_doc = {
             "camera_id": cam_id,
-            "event_type": event_type.value,
+            "event_type": stored_event_type,
             "confidence": confidence,
             "timestamp": now,
             "snapshot_path": f"/snapshots/{snapshot_filename}",
@@ -555,7 +727,7 @@ class DetectionWorker:
         
         result_insert = await events_collection().insert_one(event_doc)
         event_oid = result_insert.inserted_id
-        logger.info(f"🚨 Event generated: {event_type.value} on camera {cam_id} ({confidence:.2f})")
+        logger.info(f"🚨 Event generated: {stored_event_type} on camera {cam_id} ({confidence:.2f})")
         
         # 3. Save video clip from ring buffer (non-blocking)
         asyncio.create_task(

@@ -49,7 +49,7 @@ class EventResponse(BaseModel):
     id: str
     camera_id: str
     camera_name: Optional[str] = None
-    event_type: EventType
+    event_type: str
     confidence: float
     timestamp: datetime
     snapshot_path: str

@@ -19,7 +19,8 @@ const formatDate = (ts: string) => {
 
 const formatRelative = (ts: string) => {
     if (!ts) return '';
-    const diffMs = Date.now() - new Date(ts).getTime();
+    const utcTs = ts.endsWith('Z') || ts.includes('+') ? ts : ts + 'Z';
+    const diffMs = Date.now() - new Date(utcTs).getTime();
     const diffMin = Math.floor(diffMs / 60000);
     if (diffMin < 1) return 'Just now';
     if (diffMin < 60) return `${diffMin}m ago`;

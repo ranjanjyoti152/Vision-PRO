@@ -70,16 +70,27 @@ async def get_yolo_classes(user: dict = Depends(get_current_user)):
     import logging
     _logger = logging.getLogger(__name__)
 
-    # Strategy 1: Read from the running detection worker's loaded model
+    # Strategy 1: Read from the running detection worker's loaded engine
     try:
-        from app.workers.yolo_worker import detection_worker
-        if detection_worker.engine.model is not None:
-            names = list(detection_worker.engine.model.names.values())
+        from app.workers.yolo_worker import detection_worker, MergedYOLOEngine, YOLOEngine
+        engine = detection_worker.engine
+
+        if isinstance(engine, MergedYOLOEngine) and engine.engines:
+            # Merged model — collect classes from all sub-models
+            all_names: list[str] = []
+            for sub in engine.engines:
+                if sub.model is not None:
+                    all_names.extend(sub.model.names.values())
+            if all_names:
+                return {"classes": sorted(set(all_names))}
+
+        if isinstance(engine, YOLOEngine) and engine.model is not None:
+            names = list(engine.model.names.values())
             return {"classes": sorted(names)}
     except Exception as e:
         _logger.warning(f"Could not read classes from detection worker: {e}")
 
-    # Strategy 2: Load the active model file and instantiate temporarily
+    # Strategy 2: Load from active_model.json
     try:
         import json, os
         from app.config import settings
@@ -87,13 +98,27 @@ async def get_yolo_classes(user: dict = Depends(get_current_user)):
         if os.path.exists(active_path):
             with open(active_path) as f:
                 info = json.load(f)
-            pt_path = info.get("pt_path", "")
-            if pt_path and os.path.exists(pt_path):
+
+            if info.get("is_merged") and "models" in info:
+                # Merged model — load classes from each sub-model's .pt file
                 from ultralytics import YOLO
-                tmp_model = YOLO(pt_path)
-                names = list(tmp_model.names.values())
-                _logger.info(f"Loaded classes from active model file: {pt_path}")
-                return {"classes": sorted(names)}
+                all_names = []
+                for m in info["models"]:
+                    pt_path = m.get("pt_path", "")
+                    if pt_path and os.path.exists(pt_path):
+                        tmp = YOLO(pt_path)
+                        all_names.extend(tmp.names.values())
+                        del tmp
+                if all_names:
+                    return {"classes": sorted(set(all_names))}
+            else:
+                pt_path = info.get("pt_path", "")
+                if pt_path and os.path.exists(pt_path):
+                    from ultralytics import YOLO
+                    tmp_model = YOLO(pt_path)
+                    names = list(tmp_model.names.values())
+                    _logger.info(f"Loaded classes from active model file: {pt_path}")
+                    return {"classes": sorted(names)}
     except Exception as e:
         _logger.warning(f"Could not read classes from active model file: {e}")
 

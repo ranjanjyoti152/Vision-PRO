@@ -39,9 +39,52 @@ interface LiveCanvasProps {
     enabled: boolean;
 }
 
+/* ── Bounding-box color helper ───────────────────────────────── */
+const CLASS_COLORS: Record<string, string> = {
+    person: '#4F8EF7', car: '#FF9800', truck: '#FF9800', bus: '#FF9800',
+    motorcycle: '#FF9800', bicycle: '#66BB6A', dog: '#4CAF50', cat: '#4CAF50',
+};
+const getClassColor = (cls: string) => CLASS_COLORS[cls?.toLowerCase()] || '#00E5FF';
+
+interface Detection {
+    class: string;
+    confidence: number;
+    bbox: { x: number; y: number; w: number; h: number };
+}
+
+/* Interpolated box with velocity for prediction */
+interface TrackedBox {
+    id: number;
+    cls: string;
+    confidence: number;
+    x: number; y: number; w: number; h: number;
+    tx: number; ty: number; tw: number; th: number; // targets
+    vx: number; vy: number; // velocity (px per ms)
+    lastUpdate: number;
+    age: number; // frames since last matched
+}
+
+let _nextTrackId = 1;
+
+/* IoU between two boxes */
+const iou = (a: { x: number; y: number; w: number; h: number }, b: { x: number; y: number; w: number; h: number }) => {
+    const ax2 = a.x + a.w, ay2 = a.y + a.h;
+    const bx2 = b.x + b.w, by2 = b.y + b.h;
+    const ix = Math.max(0, Math.min(ax2, bx2) - Math.max(a.x, b.x));
+    const iy = Math.max(0, Math.min(ay2, by2) - Math.max(a.y, b.y));
+    const inter = ix * iy;
+    const union = a.w * a.h + b.w * b.h - inter;
+    return union > 0 ? inter / union : 0;
+};
+
+/* lerp */
+const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
 const LiveCameraFeed: React.FC<LiveCanvasProps> = ({ cameraId, cameraName, location }) => {
     const canvasRef = useRef<HTMLCanvasElement>(null);
+    const bboxCanvasRef = useRef<HTMLCanvasElement>(null);
     const wsRef = useRef<WebSocket | null>(null);
+    const detWsRef = useRef<WebSocket | null>(null);
     const [connected, setConnected] = useState(false);
     const [hasFrame, setHasFrame] = useState(false);
     const [fps, setFps] = useState(0);
@@ -49,6 +92,11 @@ const LiveCameraFeed: React.FC<LiveCanvasProps> = ({ cameraId, cameraName, locat
     const containerRef = useRef<HTMLDivElement>(null);
     const frameCountRef = useRef(0);
     const lastFpsTimeRef = useRef(Date.now());
+
+    /* Smooth bbox tracking state */
+    const tracksRef = useRef<TrackedBox[]>([]);
+    const frameSizeRef = useRef({ w: 1920, h: 1080 });
+    const rafRef = useRef<number>(0);
 
     const connectWs = useCallback(() => {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -70,6 +118,11 @@ const LiveCameraFeed: React.FC<LiveCanvasProps> = ({ cameraId, cameraName, locat
                     if (canvas) {
                         canvas.width = img.width;
                         canvas.height = img.height;
+                        // Sync bbox overlay canvas size
+                        if (bboxCanvasRef.current) {
+                            bboxCanvasRef.current.width = img.width;
+                            bboxCanvasRef.current.height = img.height;
+                        }
                         const ctx = canvas.getContext('2d');
                         if (ctx) {
                             ctx.drawImage(img, 0, 0);
@@ -110,16 +163,175 @@ const LiveCameraFeed: React.FC<LiveCanvasProps> = ({ cameraId, cameraName, locat
         wsRef.current = ws;
     }, [cameraId]);
 
+    /* ── Detection WebSocket + IoU-matched tracking ── */
+    const connectDetWs = useCallback(() => {
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/api/cameras/ws/${cameraId}/detections`;
+        const ws = new WebSocket(wsUrl);
+
+        ws.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                const dets: Detection[] = data.detections || [];
+                frameSizeRef.current = { w: data.frame_w || 1920, h: data.frame_h || 1080 };
+                const now = performance.now();
+                const tracks = tracksRef.current;
+
+                // Match detections to existing tracks using IoU + class
+                const used = new Set<number>();
+                const matched = new Map<number, Detection>(); // track index → detection
+
+                for (const det of dets) {
+                    let bestIdx = -1, bestIou = 0.15; // min IoU threshold
+                    for (let i = 0; i < tracks.length; i++) {
+                        if (used.has(i)) continue;
+                        if (tracks[i].cls !== det.class) continue;
+                        const score = iou(
+                            { x: tracks[i].tx, y: tracks[i].ty, w: tracks[i].tw, h: tracks[i].th },
+                            det.bbox
+                        );
+                        if (score > bestIou) { bestIou = score; bestIdx = i; }
+                    }
+                    if (bestIdx >= 0) {
+                        used.add(bestIdx);
+                        matched.set(bestIdx, det);
+                    } else {
+                        // New track
+                        tracks.push({
+                            id: _nextTrackId++,
+                            cls: det.class, confidence: det.confidence,
+                            x: det.bbox.x, y: det.bbox.y, w: det.bbox.w, h: det.bbox.h,
+                            tx: det.bbox.x, ty: det.bbox.y, tw: det.bbox.w, th: det.bbox.h,
+                            vx: 0, vy: 0, lastUpdate: now, age: 0,
+                        });
+                    }
+                }
+
+                // Update matched tracks with new targets and compute velocity
+                for (const [idx, det] of matched) {
+                    const t = tracks[idx];
+                    const dt = Math.max(1, now - t.lastUpdate);
+                    t.vx = (det.bbox.x - t.tx) / dt;
+                    t.vy = (det.bbox.y - t.ty) / dt;
+                    t.tx = det.bbox.x; t.ty = det.bbox.y;
+                    t.tw = det.bbox.w; t.th = det.bbox.h;
+                    t.confidence = det.confidence;
+                    t.lastUpdate = now;
+                    t.age = 0;
+                }
+
+                // Age unmatched tracks; remove stale ones (gone for > 500ms)
+                for (let i = tracks.length - 1; i >= 0; i--) {
+                    if (!used.has(i) && !matched.has(i) && i < tracks.length) {
+                        tracks[i].age++;
+                        if (now - tracks[i].lastUpdate > 500) {
+                            tracks.splice(i, 1);
+                        }
+                    }
+                }
+            } catch { /* ignore */ }
+        };
+
+        ws.onclose = () => {
+            setTimeout(() => {
+                if (detWsRef.current === ws) connectDetWs();
+            }, 3000);
+        };
+
+        detWsRef.current = ws;
+    }, [cameraId]);
+
+    /* Animation loop: velocity-predicted + lerp smoothing */
+    useEffect(() => {
+        let lastTime = performance.now();
+
+        const animate = (now: number) => {
+            const dt = now - lastTime;
+            lastTime = now;
+
+            const canvas = bboxCanvasRef.current;
+            if (canvas && canvas.width > 0) {
+                const ctx = canvas.getContext('2d');
+                if (ctx) {
+                    const cw = canvas.width;
+                    const ch = canvas.height;
+                    ctx.clearRect(0, 0, cw, ch);
+
+                    const { w: fw, h: fh } = frameSizeRef.current;
+                    const scaleX = cw / fw;
+                    const scaleY = ch / fh;
+
+                    for (const t of tracksRef.current) {
+                        // Predict where the target should be NOW based on velocity
+                        const elapsed = now - t.lastUpdate;
+                        const px = t.tx + t.vx * elapsed;
+                        const py = t.ty + t.vy * elapsed;
+
+                        // Exponential smoothing: converge ~95% in 100ms
+                        // factor = 1 - e^(-dt/tau), tau=30ms for snappy tracking
+                        const factor = 1 - Math.exp(-dt / 30);
+                        t.x = lerp(t.x, px, factor);
+                        t.y = lerp(t.y, py, factor);
+                        t.w = lerp(t.w, t.tw, factor);
+                        t.h = lerp(t.h, t.th, factor);
+
+                        // Fade out stale tracks
+                        const alpha = t.age > 0 ? Math.max(0, 1 - t.age * 0.25) : 1;
+                        if (alpha <= 0) continue;
+
+                        const x = t.x * scaleX;
+                        const y = t.y * scaleY;
+                        const w = t.w * scaleX;
+                        const h = t.h * scaleY;
+                        const color = getClassColor(t.cls);
+                        const label = `${t.cls} ${Math.round(t.confidence * 100)}%`;
+
+                        ctx.globalAlpha = alpha;
+
+                        // Box
+                        ctx.strokeStyle = color;
+                        ctx.lineWidth = 2;
+                        ctx.strokeRect(x, y, w, h);
+
+                        // Corner accents
+                        const cLen = Math.min(w, h, 16) * 0.4;
+                        ctx.lineWidth = 3;
+                        ctx.beginPath(); ctx.moveTo(x, y + cLen); ctx.lineTo(x, y); ctx.lineTo(x + cLen, y); ctx.stroke();
+                        ctx.beginPath(); ctx.moveTo(x + w - cLen, y + h); ctx.lineTo(x + w, y + h); ctx.lineTo(x + w, y + h - cLen); ctx.stroke();
+
+                        // Label
+                        ctx.font = 'bold 11px Inter, system-ui, sans-serif';
+                        const tm = ctx.measureText(label);
+                        ctx.fillStyle = color + 'CC';
+                        ctx.beginPath(); ctx.roundRect(x, y - 18, tm.width + 8, 16, 3); ctx.fill();
+                        ctx.fillStyle = '#000';
+                        ctx.fillText(label, x + 4, y - 5);
+
+                        ctx.globalAlpha = 1;
+                    }
+                }
+            }
+            rafRef.current = requestAnimationFrame(animate);
+        };
+        rafRef.current = requestAnimationFrame(animate);
+        return () => cancelAnimationFrame(rafRef.current);
+    }, []);
+
     useEffect(() => {
         setHasFrame(false);  // Reset on camera change
         connectWs();
+        connectDetWs();
         return () => {
             if (wsRef.current) {
                 wsRef.current.close();
                 wsRef.current = null;
             }
+            if (detWsRef.current) {
+                detWsRef.current.close();
+                detWsRef.current = null;
+            }
         };
-    }, [connectWs]);
+    }, [connectWs, connectDetWs]);
 
     const toggleFullscreen = () => {
         if (!containerRef.current) return;
@@ -150,6 +362,17 @@ const LiveCameraFeed: React.FC<LiveCanvasProps> = ({ cameraId, cameraName, locat
                     height: '100%',
                     objectFit: 'cover',
                     display: 'block',
+                }}
+            />
+            {/* Bounding box overlay */}
+            <canvas
+                ref={bboxCanvasRef}
+                style={{
+                    position: 'absolute',
+                    top: 0, left: 0,
+                    width: '100%',
+                    height: '100%',
+                    pointerEvents: 'none',
                 }}
             />
 

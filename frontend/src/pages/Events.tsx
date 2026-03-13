@@ -39,7 +39,9 @@ const eventIcon = (type: string) => {
 
 const formatTime = (ts: string) => {
     if (!ts) return '';
-    const d = new Date(ts);
+    // Backend stores UTC but may omit the Z suffix — ensure JS parses as UTC
+    const utcTs = ts.endsWith('Z') || ts.includes('+') ? ts : ts + 'Z';
+    const d = new Date(utcTs);
     const now = new Date();
     const diffMs = now.getTime() - d.getTime();
     const diffMin = Math.floor(diffMs / 60000);

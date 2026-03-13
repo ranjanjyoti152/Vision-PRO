@@ -36,7 +36,8 @@ const formatSize = (bytes: number) => {
 
 const formatTime = (iso: string) => {
     if (!iso) return '';
-    const d = new Date(iso);
+    const utcIso = iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z';
+    const d = new Date(utcIso);
     return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 };
 
