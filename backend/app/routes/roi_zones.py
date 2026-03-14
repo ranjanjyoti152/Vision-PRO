@@ -19,12 +19,14 @@ class ROIZoneCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     camera_id: str
     points: list[list[float]]  # [[x,y], ...] normalised 0-1
-    trigger_type: str = Field(default="enter")  # enter | exit | loiter | enter_exit
+    trigger_type: str = Field(default="enter")  # enter | exit | loiter | enter_exit | crowd | absence | stopped | tailgating
     trigger_classes: list[str] = Field(default=["person", "vehicle"])
     enabled: bool = True
     color: str = Field(default="#FF5722")
     notify: bool = True
     loiter_seconds: int = Field(default=10, ge=1, le=300)
+    crowd_threshold: int = Field(default=5, ge=2, le=100)
+    absence_timeout: int = Field(default=60, ge=10, le=3600)
 
 
 class ROIZoneUpdate(BaseModel):
@@ -36,6 +38,8 @@ class ROIZoneUpdate(BaseModel):
     color: Optional[str] = None
     notify: Optional[bool] = None
     loiter_seconds: Optional[int] = None
+    crowd_threshold: Optional[int] = None
+    absence_timeout: Optional[int] = None
 
 
 # ── YOLO COCO-80 class names (standard) ─────────────────────────────

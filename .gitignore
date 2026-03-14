@@ -70,3 +70,6 @@ docker/data/
 # Runtime
 *.pt
 !backend/models/.gitkeep
+
+# Wheel packages
+*.whl

@@ -91,11 +91,44 @@ async def test_notification(
     admin: dict = Depends(require_admin),
 ):
     """Send a test notification via the specified provider."""
-    # TODO: Implement actual notification sending in Phase 6
-    return {
-        "message": f"Test notification sent via {request.provider.value}",
-        "status": "pending_implementation",
+    from datetime import datetime, timezone
+    from app.services.notification_service import notification_service
+
+    settings = await notification_service._get_notification_settings()
+    provider = request.provider.value
+
+    test_event = {
+        "event_type": "person",
+        "camera_name": "Test Camera",
+        "confidence": 0.95,
+        "timestamp": datetime.now(timezone.utc),
+        "detected_objects": [{"class": "person", "confidence": 0.95}],
+        "ai_summary": "This is a test notification from Vision Pro NVR. If you received this, notifications are working correctly!",
+        "bounding_box": {"x": 100, "y": 200, "w": 50, "h": 100},
     }
+
+    try:
+        if provider == "telegram":
+            if not settings.get("telegram_bot_token") or not settings.get("telegram_chat_id"):
+                raise HTTPException(status_code=400, detail="Telegram bot token and chat ID are required")
+            await notification_service.send_telegram(
+                settings["telegram_bot_token"], settings["telegram_chat_id"],
+                "🧪 Vision Pro Test: Telegram notifications are working!"
+            )
+        elif provider == "email":
+            if not settings.get("email_smtp_host"):
+                raise HTTPException(status_code=400, detail="SMTP host is not configured")
+            await notification_service.send_email(settings, "Vision Pro Test Email", event_data=test_event)
+        elif provider == "whatsapp":
+            await notification_service.send_whatsapp(settings, "🧪 Vision Pro Test: WhatsApp notifications are working!")
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
+
+        return {"message": f"Test notification sent via {provider}", "status": "success"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send test notification: {str(e)}")
 
 
 @router.get("/llm")

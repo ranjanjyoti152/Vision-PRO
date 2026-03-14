@@ -10,7 +10,7 @@ import {
     VisibilityOff, NotificationsActive, NotificationsOff,
     PhotoCamera, Undo, CheckCircle, Warning,
     Login as EnterIcon, Logout as ExitIcon, Timer, SwapHoriz,
-    Videocam,
+    Videocam, Groups, PersonOff, PanTool, DirectionsRun,
 } from '@mui/icons-material';
 import api, { camerasApi, roiApi } from '../services/api';
 
@@ -27,6 +27,8 @@ interface ROIZone {
     color: string;
     notify: boolean;
     loiter_seconds: number;
+    crowd_threshold?: number;
+    absence_timeout?: number;
 }
 
 interface Camera {
@@ -41,6 +43,10 @@ const TRIGGER_TYPES = [
     { value: 'exit', label: 'Exit Zone', icon: <ExitIcon sx={{ fontSize: 18 }} />, desc: 'Object exits the zone' },
     { value: 'loiter', label: 'Loiter', icon: <Timer sx={{ fontSize: 18 }} />, desc: 'Object stays too long' },
     { value: 'enter_exit', label: 'Enter + Exit', icon: <SwapHoriz sx={{ fontSize: 18 }} />, desc: 'Both enter and exit' },
+    { value: 'crowd', label: 'Crowd', icon: <Groups sx={{ fontSize: 18 }} />, desc: 'Too many objects in zone' },
+    { value: 'absence', label: 'Absence', icon: <PersonOff sx={{ fontSize: 18 }} />, desc: 'Expected object missing' },
+    { value: 'stopped', label: 'Stopped Object', icon: <PanTool sx={{ fontSize: 18 }} />, desc: 'Object stops in zone' },
+    { value: 'tailgating', label: 'Tailgating', icon: <DirectionsRun sx={{ fontSize: 18 }} />, desc: 'Rapid successive entries' },
 ];
 
 const ZONE_COLORS = [
@@ -71,6 +77,8 @@ const ROIZones: React.FC = () => {
     const [zoneColor, setZoneColor] = useState('#FF5722');
     const [notify, setNotify] = useState(true);
     const [loiterSeconds, setLoiterSeconds] = useState(10);
+    const [crowdThreshold, setCrowdThreshold] = useState(5);
+    const [absenceTimeout, setAbsenceTimeout] = useState(60);
 
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const imgRef = useRef<HTMLImageElement>(null);
@@ -241,9 +249,10 @@ const ROIZones: React.FC = () => {
         if (currentPoints.length < 3) return;
         setLoading(true);
         try {
-            const payload = {
+            const payload: any = {
                 name: zoneName, points: currentPoints, trigger_type: triggerType,
                 trigger_classes: triggerClasses, color: zoneColor, notify, loiter_seconds: loiterSeconds,
+                crowd_threshold: crowdThreshold, absence_timeout: absenceTimeout,
             };
             if (editingZone) {
                 await roiApi.update(editingZone.id, payload);
@@ -273,6 +282,8 @@ const ROIZones: React.FC = () => {
         setZoneColor(zone.color);
         setNotify(zone.notify);
         setLoiterSeconds(zone.loiter_seconds);
+        setCrowdThreshold((zone as any).crowd_threshold || 5);
+        setAbsenceTimeout((zone as any).absence_timeout || 60);
         setDrawing(true);
     };
 
@@ -287,6 +298,8 @@ const ROIZones: React.FC = () => {
         setZoneColor(ZONE_COLORS[Math.floor(Math.random() * ZONE_COLORS.length)]);
         setNotify(true);
         setLoiterSeconds(10);
+        setCrowdThreshold(5);
+        setAbsenceTimeout(60);
     };
 
     const startDrawing = () => {
@@ -562,7 +575,7 @@ const ROIZones: React.FC = () => {
                     <Typography variant="caption" sx={{ fontWeight: 600, color: 'rgba(255,255,255,0.6)', mb: 1, display: 'block', textTransform: 'uppercase', fontSize: '0.62rem', letterSpacing: '0.06em' }}>
                         Trigger Type
                     </Typography>
-                    <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, mb: 2.5 }}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 1, mb: 2.5, maxHeight: 220, overflow: 'auto' }}>
                         {TRIGGER_TYPES.map(t => (
                             <Paper key={t.value} elevation={0} onClick={() => setTriggerType(t.value)}
                                 sx={{
@@ -584,6 +597,30 @@ const ROIZones: React.FC = () => {
                             value={loiterSeconds} onChange={e => setLoiterSeconds(Number(e.target.value))}
                             size="small" sx={{ mb: 2.5, '& .MuiOutlinedInput-root': { borderRadius: 2 } }}
                             inputProps={{ min: 1, max: 300 }} />
+                    )}
+
+                    {triggerType === 'crowd' && (
+                        <TextField fullWidth label="Crowd Threshold (max objects)" type="number"
+                            value={crowdThreshold} onChange={e => setCrowdThreshold(Number(e.target.value))}
+                            size="small" sx={{ mb: 2.5, '& .MuiOutlinedInput-root': { borderRadius: 2 } }}
+                            inputProps={{ min: 2, max: 100 }}
+                            helperText="Trigger when object count in zone exceeds this number" />
+                    )}
+
+                    {triggerType === 'absence' && (
+                        <TextField fullWidth label="Absence Timeout (seconds)" type="number"
+                            value={absenceTimeout} onChange={e => setAbsenceTimeout(Number(e.target.value))}
+                            size="small" sx={{ mb: 2.5, '& .MuiOutlinedInput-root': { borderRadius: 2 } }}
+                            inputProps={{ min: 10, max: 3600 }}
+                            helperText="Trigger when no matching object is found for this duration" />
+                    )}
+
+                    {triggerType === 'stopped' && (
+                        <TextField fullWidth label="Stopped Duration (seconds)" type="number"
+                            value={loiterSeconds} onChange={e => setLoiterSeconds(Number(e.target.value))}
+                            size="small" sx={{ mb: 2.5, '& .MuiOutlinedInput-root': { borderRadius: 2 } }}
+                            inputProps={{ min: 5, max: 300 }}
+                            helperText="Trigger when object remains stationary for this duration" />
                     )}
 
                     {/* Detection classes */}

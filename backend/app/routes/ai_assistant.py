@@ -131,16 +131,26 @@ async def _fetch_event_context(user_msg: str, base_url: str) -> dict:
             hour_key = local_ts.strftime("%H:00")
             hourly_counts[hour_key] = hourly_counts.get(hour_key, 0) + 1
 
-    # Get camera names (resolve before building recent_events)
+    # Get ALL cameras (so we can show cameras with AND without events)
+    from bson import ObjectId
     camera_names = {}
-    if camera_counts:
-        cam_ids = list(camera_counts.keys())
-        from bson import ObjectId
-        cam_cursor = cameras_collection().find(
-            {"_id": {"$in": [ObjectId(cid) for cid in cam_ids if ObjectId.is_valid(cid)]}}
-        )
-        async for cam in cam_cursor:
-            camera_names[str(cam["_id"])] = cam.get("name", str(cam["_id"]))
+    all_camera_names = []
+    try:
+        all_cams_cursor = cameras_collection().find({}, {"name": 1})
+        async for cam in all_cams_cursor:
+            cid = str(cam["_id"])
+            cname = cam.get("name", cid)
+            camera_names[cid] = cname
+            all_camera_names.append(cname)
+    except Exception:
+        # Fallback: at least resolve cameras that have events
+        if camera_counts:
+            cam_ids = list(camera_counts.keys())
+            cam_cursor = cameras_collection().find(
+                {"_id": {"$in": [ObjectId(cid) for cid in cam_ids if ObjectId.is_valid(cid)]}}
+            )
+            async for cam in cam_cursor:
+                camera_names[str(cam["_id"])] = cam.get("name", str(cam["_id"]))
 
     # Get the 20 most recent events with details
     for evt in events[:20]:
@@ -157,11 +167,16 @@ async def _fetch_event_context(user_msg: str, base_url: str) -> dict:
             "video_clip_url": f"{base_url}{evt.get('video_clip_path', '')}" if evt.get("video_clip_path") else "",
         })
 
-    # Build camera stats with names
+    # Build camera stats with names — include ALL cameras (0 for inactive ones)
     camera_stats = {}
     for cam_id, count in camera_counts.items():
         name = camera_names.get(cam_id, cam_id)
         camera_stats[name] = count
+    # Add cameras that had NO events in this period
+    cameras_with_events = set(camera_stats.keys())
+    cameras_no_events = [n for n in all_camera_names if n not in cameras_with_events]
+    for cam_name in cameras_no_events:
+        camera_stats[cam_name] = 0
 
     # Semantic search: find events most relevant to the user's message
     semantic_results = []
@@ -238,6 +253,8 @@ def _build_system_prompt(context: dict) -> str:
         "4. You CAN show event snapshots: use ![description](snapshot_url)",
         "5. When describing events, tell it like a story — times, actions, cameras, what happened",
         "6. All times shown are in the user's LOCAL timezone. Use 12-hour format (e.g., 2:30 PM) when talking to the user.",
+        "7. ALWAYS check the 'Camera Activity' section below for the COMPLETE list of cameras and their event counts. Cameras with 0 events had no activity. NEVER guess or hallucinate camera names.",
+        "8. When asked about 'other cameras' or 'all cameras', refer to the Camera Activity section — list EVERY camera with its count. Don't skip cameras that have events.",
         "",
         f"## CURRENT TIME: {context.get('current_local_time', 'unknown')}",
         f"## DATA ({context['time_range']}): {context['total_events']} events",
@@ -251,9 +268,15 @@ def _build_system_prompt(context: dict) -> str:
         lines.append(f"- {etype}: {count}")
 
     lines.append("")
-    lines.append("### Camera Activity:")
-    for cam_name, count in context["camera_breakdown"].items():
-        lines.append(f"- {cam_name}: {count} events")
+    lines.append("### Camera Activity (ALL cameras in the system):")
+    # Show cameras with events first, then cameras with no events
+    active_cams = {k: v for k, v in context["camera_breakdown"].items() if v > 0}
+    idle_cams = {k: v for k, v in context["camera_breakdown"].items() if v == 0}
+    for cam_name, count in active_cams.items():
+        lines.append(f"- **{cam_name}: {count} events** ✅")
+    if idle_cams:
+        for cam_name in idle_cams:
+            lines.append(f"- {cam_name}: 0 events (no activity)")
 
     if context.get("hourly_distribution"):
         lines.append("")

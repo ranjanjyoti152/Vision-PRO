@@ -18,10 +18,18 @@ _QUEUE_MAX = 20
 
 # System prompt for event summaries
 _SUMMARY_SYSTEM = (
-    "You are an expert security surveillance AI analyst. "
-    "You generate concise, professional, single-sentence event summaries "
-    "for a video management system. Be specific and actionable. "
-    "Never include quotes, preamble, or extra text — output ONLY the summary sentence."
+    "You are an expert security surveillance AI analyst for a video management system. "
+    "Generate a SPECIFIC, UNIQUE, single-sentence event summary that a security operator can act on. "
+    "Rules:\n"
+    "- ALWAYS mention the camera name/location and approximate time of day (morning/afternoon/evening/night).\n"
+    "- Describe the SPECIFIC activity: direction of movement, posture, interactions between objects.\n"
+    "- Mention distinguishing details: clothing colors, vehicle type/color, bag, package, etc.\n"
+    "- READ any visible text, brand names, logos, or signage on objects, clothing, bags, boxes, or vehicles "
+    "(e.g. 'Ekart delivery package', 'Amazon box', 'Swiggy bag', 'Zomato rider', license plate text).\n"
+    "- Identify the PURPOSE when possible: delivery person, courier, visitor, passerby, parked vehicle, stray animal.\n"
+    "- For multiple objects, describe how they relate spatially (near gate, beside vehicle, crossing road).\n"
+    "- NEVER use generic phrases like 'a person was detected' or 'activity was observed'.\n"
+    "- Output ONLY the summary sentence — no quotes, preamble, or extra text."
 )
 
 
@@ -52,6 +60,9 @@ class LLMService:
                 ai_summary = await self.generate_event_summary(
                     event_type, confidence, objects, face_name,
                     snapshot_path=job.get("snapshot_path"),
+                    camera_name=job.get("camera_name"),
+                    camera_location=job.get("camera_location"),
+                    timestamp=job.get("timestamp"),
                 )
                 if ai_summary and ai_summary not in ("Event detected.", ""):
                     from app.database import events_collection
@@ -64,8 +75,22 @@ class LLMService:
                     await self._embed_event(event_oid, ai_summary, job)
                 else:
                     logger.warning(f"⚠️ LLM returned empty/fallback summary for event {event_oid}")
+                    ai_summary = None
                     # Still embed with whatever we have
                     await self._embed_event(event_oid, None, job)
+
+                # Dispatch email/telegram/whatsapp notifications with the real AI summary
+                notify_data = job.get("notify_data")
+                if notify_data:
+                    try:
+                        from app.services.notification_service import notification_service
+                        notify_data["ai_summary"] = ai_summary or f"{event_type.value if hasattr(event_type, 'value') else event_type} detected"
+                        snapshot_path = notify_data.pop("snapshot_path", None)
+                        await notification_service.dispatch(
+                            notify_data["ai_summary"], snapshot_path, event_data=notify_data
+                        )
+                    except Exception as ne:
+                        logger.warning(f"📧 Notification dispatch failed for event {event_oid}: {ne}")
             except Exception as e:
                 logger.warning(f"❌ Summary queue job failed for event {job.get('event_oid', '?')}: {e}")
             finally:
@@ -112,7 +137,7 @@ class LLMService:
         except Exception as e:
             logger.warning(f"⚠️ Failed to embed event {event_oid}: {e}")
 
-    def enqueue_summary(self, event_oid, event_type, confidence, objects, face_name=None, snapshot_path=None):
+    def enqueue_summary(self, event_oid, event_type, confidence, objects, face_name=None, snapshot_path=None, notify_data=None, camera_name=None, camera_location=None, timestamp=None):
         """Add a summary job to the queue. Drops silently if queue is full."""
         self._ensure_queue()
         try:
@@ -123,6 +148,10 @@ class LLMService:
                 "objects": objects,
                 "face_name": face_name,
                 "snapshot_path": snapshot_path,
+                "notify_data": notify_data,
+                "camera_name": camera_name,
+                "camera_location": camera_location,
+                "timestamp": timestamp,
             })
             logger.info(f"📝 Queued summary for {event_type} event (pending: {self._queue.qsize()})")
         except asyncio.QueueFull:
@@ -144,16 +173,54 @@ class LLMService:
             settings[key] = value
         return settings
 
-    async def generate_event_summary(self, event_type: EventType, confidence: float, objects: List[Dict], face_name: Optional[str] = None, snapshot_path: Optional[str] = None) -> str:
+    async def generate_event_summary(self, event_type: EventType, confidence: float, objects: List[Dict], face_name: Optional[str] = None, snapshot_path: Optional[str] = None, camera_name: Optional[str] = None, camera_location: Optional[str] = None, timestamp=None) -> str:
         """Generate a concise 1-sentence summary of an event, with optional image analysis."""
 
-        # Build a descriptive context
-        objects_str = ", ".join([
-            f"{obj.get('class', 'unknown')} ({obj.get('confidence', 0):.0%})"
-            for obj in objects
-        ])
-        if not objects_str:
-            objects_str = "no specific objects"
+        # Build rich object descriptions
+        obj_details = []
+        for obj in objects:
+            cls = obj.get('class', 'unknown')
+            conf = obj.get('confidence', 0)
+            bbox = obj.get('bbox', {})
+            w = bbox.get('w', 0) if isinstance(bbox, dict) else 0
+            h = bbox.get('h', 0) if isinstance(bbox, dict) else 0
+            size_hint = "large" if w * h > 150000 else "medium" if w * h > 40000 else "small"
+            obj_details.append(f"{cls} ({conf:.0%}, {size_hint} in frame)")
+        objects_str = ", ".join(obj_details) if obj_details else "no specific objects"
+
+        # Derive time-of-day from timestamp
+        time_label = ""
+        if timestamp:
+            try:
+                hour = timestamp.hour if hasattr(timestamp, 'hour') else 12
+                if hour < 6:
+                    time_label = "early morning"
+                elif hour < 12:
+                    time_label = "morning"
+                elif hour < 17:
+                    time_label = "afternoon"
+                elif hour < 21:
+                    time_label = "evening"
+                else:
+                    time_label = "night"
+            except Exception:
+                pass
+
+        # Build location context line
+        location_ctx = ""
+        if camera_name:
+            location_ctx = f"Camera: {camera_name}"
+            if camera_location:
+                location_ctx += f" (location: {camera_location})"
+            if time_label:
+                location_ctx += f", time of day: {time_label}"
+        elif time_label:
+            location_ctx = f"Time of day: {time_label}"
+
+        # Object count summary
+        from collections import Counter
+        class_counts = Counter(obj.get('class', 'unknown') for obj in objects)
+        count_str = ", ".join(f"{count} {cls}" for cls, count in class_counts.items())
 
         # Load snapshot image if available
         image_b64 = None
@@ -168,23 +235,47 @@ class LLMService:
 
         if image_b64:
             prompt = (
-                f"Analyze this security camera snapshot and describe what you see in one professional sentence.\n"
-                f"Context: Event type is '{event_type.value}', confidence {confidence:.0%}.\n"
-                f"Detected objects: {objects_str}\n"
+                f"Analyze this security camera snapshot and describe the scene in one specific, actionable sentence.\n"
+                f"Detection context:\n"
+            )
+            if location_ctx:
+                prompt += f"• {location_ctx}\n"
+            prompt += (
+                f"• Event trigger: {event_type.value} ({confidence:.0%} confidence)\n"
+                f"• Objects detected: {objects_str}\n"
+                f"• Object count: {count_str}\n"
             )
             if face_name:
-                prompt += f"Known individual identified: {face_name}\n"
-            prompt += "\nDescribe the ACTUAL scene — what's happening, who/what is visible, the setting. Output ONLY the summary sentence."
+                prompt += f"• Identified person: {face_name}\n"
+            prompt += (
+                "\nIMPORTANT INSTRUCTIONS for image analysis:\n"
+                "1. READ any visible text, brand names, logos, or labels on bags, boxes, packages, vehicles, clothing, "
+                "or signage (e.g. 'Ekart', 'Amazon', 'Flipkart', 'Swiggy', 'Zomato', 'Delhivery', shop names, license plates).\n"
+                "2. If a delivery bag/box is visible, identify the service (e.g. 'carrying an Ekart delivery package').\n"
+                "3. Describe clothing colors & style (e.g. 'man in dark shirt and jeans').\n"
+                "4. Note vehicle make/color/type if visible (e.g. 'black sedan', 'white Activa scooter').\n"
+                "5. Describe what the person is DOING and their direction of movement.\n"
+                "6. Mention the camera name and time of day at the START of your sentence.\n"
+                "Output ONLY the summary sentence."
+            )
         else:
             prompt = (
-                f"Summarize this security camera event in one professional sentence:\n"
-                f"• Event type: {event_type.value}\n"
-                f"• Detection confidence: {confidence:.0%}\n"
+                f"Generate a specific security event summary in one sentence:\n"
+            )
+            if location_ctx:
+                prompt += f"• {location_ctx}\n"
+            prompt += (
+                f"• Event trigger: {event_type.value} ({confidence:.0%} confidence)\n"
                 f"• Objects detected: {objects_str}\n"
+                f"• Object count: {count_str}\n"
             )
             if face_name:
-                prompt += f"• Known individual identified: {face_name}\n"
-            prompt += "\nProvide ONLY the summary sentence."
+                prompt += f"• Identified person: {face_name}\n"
+            prompt += (
+                "\nMention the camera name/location, time of day, and describe the specific activity "
+                "including any identifiable details (delivery service, vehicle type, clothing). "
+                "Output ONLY the summary sentence."
+            )
 
         return await self._generate_text(prompt, fallback="Event detected.", image_b64=image_b64)
 

@@ -203,6 +203,18 @@ class DetectionWorker:
         self._roi_cache_ttl: float = 30  # Refresh every 30 seconds
         self._roi_cooldowns: Dict[str, float] = {}  # zone_id -> last trigger time
 
+        # ── Trigger state tracking ──────────────────────────────────
+        # zone_id -> set of object class+approx_position keys currently inside
+        self._zone_occupants: Dict[str, set] = {}
+        # zone_id -> {obj_key: first_seen_time} for loiter/stopped tracking
+        self._zone_timers: Dict[str, Dict[str, float]] = {}
+        # zone_id -> {obj_key: (last_cx, last_cy)} for stopped detection
+        self._zone_positions: Dict[str, Dict[str, tuple]] = {}
+        # zone_id -> last_time_object_seen (for absence detection)
+        self._zone_last_seen: Dict[str, float] = {}
+        # zone_id -> list of entry timestamps (for tailgating detection)
+        self._zone_entry_times: Dict[str, list] = {}
+
     def start(self):
         """Start the worker loop."""
         if self._running:
@@ -507,13 +519,26 @@ class DetectionWorker:
         trigger_event_type = roi_trigger["event_type"]
         trigger_conf = roi_trigger["confidence"]
         trigger_bbox = roi_trigger["bbox"]
+        roi_classes = roi_trigger.get("trigger_classes", [])
+
+        # Filter detected_objs to only include classes selected in the ROI zone
+        if roi_classes:
+            filtered_objs = [
+                obj for obj in detected_objs
+                if obj.class_name in roi_classes
+                or self._map_class_to_event_type(obj.class_name).value in roi_classes
+            ]
+        else:
+            filtered_objs = detected_objs
 
         # Override with face info if the triggering object was a person and face was recognized
         if face_id and trigger_event_type == EventType.PERSON:
             trigger_event_type = highest_conf_class  # FACE_KNOWN or FACE_UNKNOWN
 
         try:
-            await self._create_event(cam_id, trigger_event_type, trigger_conf, trigger_bbox, detected_objs, frame, result, face_id, trigger_class_name)
+            cam_name = cam.get("name", cam_id)
+            cam_location = cam.get("location", "")
+            await self._create_event(cam_id, trigger_event_type, trigger_conf, trigger_bbox, filtered_objs, frame, result, face_id, trigger_class_name, cam_name, cam_location)
         except Exception as e:
             logger.error(f"❌ Failed to create event for camera {cam_id}: {e}", exc_info=True)
 
@@ -559,6 +584,7 @@ class DetectionWorker:
 
     async def _check_roi_zones(self, cam_id: str, detected_objs: list, frame: np.ndarray) -> dict | None:
         """Check if any detected objects fall inside active ROI zones.
+        Supports trigger types: enter, exit, loiter, enter_exit, crowd, absence, stopped, tailgating.
         Returns info about the triggering object if found, None otherwise.
         """
         import time as _time
@@ -571,8 +597,12 @@ class DetectionWorker:
 
         for zone in zones:
             zone_id = str(zone["_id"])
-            trigger_classes = zone.get("trigger_classes", [])
+            trigger_type = zone.get("trigger_type", "enter")
+            trigger_classes = zone.get("trigger_classes") or []
             zone_points = zone.get("points", [])
+            zone_name = zone.get("name", "ROI Zone")
+            if not trigger_classes:
+                continue  # No classes selected — skip this zone
             if len(zone_points) < 3:
                 continue
 
@@ -587,17 +617,14 @@ class DetectionWorker:
             if now - last_trigger < 30:
                 continue
 
+            # ── Find all matching objects inside/outside this zone ───
+            inside_objs = []
             for obj in detected_objs:
-                # Get raw class name from DetectedObject
                 obj_class = obj.class_name
-
-                # Check if the object's class matches the zone's trigger classes
-                raw_trigger = trigger_classes  # e.g. ["person", "car"]
                 mapped = self._map_class_to_event_type(obj_class)
-                if obj_class not in raw_trigger and mapped.value not in raw_trigger:
+                if obj_class not in trigger_classes and mapped.value not in trigger_classes:
                     continue
 
-                # Get object center from bbox
                 bbox = obj.bbox
                 if isinstance(bbox, dict):
                     cx = bbox.get("x", 0) + bbox.get("w", 0) // 2
@@ -606,38 +633,203 @@ class DetectionWorker:
                     cx = bbox.x + bbox.w // 2
                     cy = bbox.y + bbox.h // 2
 
-
-                # Point-in-polygon test
                 result = cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False)
                 if result >= 0:
-                    # Object is inside the zone!
-                    self._roi_cooldowns[zone_id] = now
-                    zone_name = zone.get("name", "ROI Zone")
-                    logger.info(f"🎯 ROI triggered: '{zone_name}' — {obj_class} detected in zone on camera {cam_id}")
+                    inside_objs.append((obj, obj_class, mapped, cx, cy))
 
-                    # Send notification if enabled
-                    if zone.get("notify"):
-                        try:
-                            await notification_service.send(
-                                title=f"🎯 ROI Alert: {zone_name}",
-                                message=f"{obj_class} detected in '{zone_name}' zone",
-                                priority="high",
-                            )
-                        except Exception as e:
-                            logger.warning(f"ROI notification failed: {e}")
-                    # Return the triggering object info
-                    obj_bbox = obj.bbox
-                    if isinstance(obj_bbox, dict):
-                        trigger_bbox = BoundingBox(**obj_bbox)
+            # ── Current occupant keys ───────────────────────────────
+            current_keys = set()
+            for obj, obj_class, _, cx, cy in inside_objs:
+                # Use class + grid position as rough object key
+                grid_x = int(cx / max(w, 1) * 10)
+                grid_y = int(cy / max(h, 1) * 10)
+                current_keys.add(f"{obj_class}_{grid_x}_{grid_y}")
+
+            prev_keys = self._zone_occupants.get(zone_id, set())
+
+            # Helper to fire trigger
+            def _build_trigger(obj, obj_class, mapped, msg):
+                self._roi_cooldowns[zone_id] = now
+                logger.info(f"🎯 ROI [{trigger_type}] '{zone_name}' — {msg} on camera {cam_id}")
+                obj_bbox = obj.bbox
+                if isinstance(obj_bbox, dict):
+                    trigger_bbox = BoundingBox(**obj_bbox)
+                else:
+                    trigger_bbox = obj_bbox
+                return {
+                    "class_name": obj_class,
+                    "event_type": mapped,
+                    "confidence": obj.confidence,
+                    "bbox": trigger_bbox,
+                    "zone_name": zone_name,
+                    "trigger_type": trigger_type,
+                    "trigger_classes": trigger_classes,
+                }
+
+            triggered = None
+
+            # ── ENTER: new objects appeared in zone ─────────────────
+            if trigger_type == "enter":
+                new_keys = current_keys - prev_keys
+                if new_keys and inside_objs:
+                    obj, obj_class, mapped, _, _ = inside_objs[0]
+                    triggered = _build_trigger(obj, obj_class, mapped, f"{obj_class} entered zone")
+
+            # ── EXIT: objects that were inside are now gone ──────────
+            elif trigger_type == "exit":
+                gone_keys = prev_keys - current_keys
+                if gone_keys and detected_objs:
+                    # Use the first detected obj as representative
+                    for obj in detected_objs:
+                        obj_class = obj.class_name
+                        mapped = self._map_class_to_event_type(obj_class)
+                        if obj_class in trigger_classes or mapped.value in trigger_classes:
+                            triggered = _build_trigger(obj, obj_class, mapped, f"{obj_class} exited zone")
+                            break
+
+            # ── ENTER + EXIT ────────────────────────────────────────
+            elif trigger_type == "enter_exit":
+                new_keys = current_keys - prev_keys
+                gone_keys = prev_keys - current_keys
+                if (new_keys or gone_keys) and (inside_objs or detected_objs):
+                    if new_keys and inside_objs:
+                        obj, obj_class, mapped, _, _ = inside_objs[0]
+                        action = "entered"
+                    elif gone_keys:
+                        obj = detected_objs[0]
+                        obj_class = obj.class_name
+                        mapped = self._map_class_to_event_type(obj_class)
+                        action = "exited"
+                    triggered = _build_trigger(obj, obj_class, mapped, f"{obj_class} {action} zone")
+
+            # ── LOITER: object inside zone for too long ─────────────
+            elif trigger_type == "loiter":
+                loiter_limit = zone.get("loiter_seconds", 10)
+                timers = self._zone_timers.setdefault(zone_id, {})
+                # Update timers for current occupants
+                for key in current_keys:
+                    if key not in timers:
+                        timers[key] = now
+                # Remove timers for objects that left
+                for key in list(timers.keys()):
+                    if key not in current_keys:
+                        del timers[key]
+                # Check if any object exceeded loiter time
+                for key, first_seen in timers.items():
+                    if now - first_seen >= loiter_limit and inside_objs:
+                        obj, obj_class, mapped, _, _ = inside_objs[0]
+                        triggered = _build_trigger(obj, obj_class, mapped,
+                            f"{obj_class} loitering {int(now - first_seen)}s")
+                        timers.clear()  # Reset after trigger
+                        break
+
+            # ── CROWD: too many objects in zone ─────────────────────
+            elif trigger_type == "crowd":
+                threshold = zone.get("crowd_threshold", 5)
+                if len(inside_objs) >= threshold:
+                    obj, obj_class, mapped, _, _ = inside_objs[0]
+                    triggered = _build_trigger(obj, obj_class, mapped,
+                        f"crowd detected ({len(inside_objs)} objects, threshold {threshold})")
+
+            # ── ABSENCE: no matching objects for too long ───────────
+            elif trigger_type == "absence":
+                timeout = zone.get("absence_timeout", 60)
+                if inside_objs:
+                    self._zone_last_seen[zone_id] = now
+                else:
+                    last_seen = self._zone_last_seen.get(zone_id)
+                    if last_seen is None:
+                        # First time — initialize
+                        self._zone_last_seen[zone_id] = now
+                    elif now - last_seen >= timeout:
+                        # No objects seen for too long — trigger with a dummy
+                        for obj in detected_objs:
+                            obj_class = obj.class_name
+                            mapped = self._map_class_to_event_type(obj_class)
+                            if obj_class in trigger_classes or mapped.value in trigger_classes:
+                                triggered = _build_trigger(obj, obj_class, mapped,
+                                    f"absence detected — no {obj_class} for {int(now - last_seen)}s")
+                                self._zone_last_seen[zone_id] = now  # Reset
+                                break
+                        if not triggered and detected_objs:
+                            obj = detected_objs[0]
+                            obj_class = obj.class_name
+                            mapped = self._map_class_to_event_type(obj_class)
+                            triggered = _build_trigger(obj, obj_class, mapped,
+                                f"absence — no matching object for {int(now - last_seen)}s")
+                            self._zone_last_seen[zone_id] = now
+
+            # ── STOPPED: object stationary in zone ──────────────────
+            elif trigger_type == "stopped":
+                stop_limit = zone.get("loiter_seconds", 10)
+                positions = self._zone_positions.setdefault(zone_id, {})
+                timers = self._zone_timers.setdefault(zone_id, {})
+                move_threshold = max(w, h) * 0.02  # 2% of frame dimension
+
+                for obj, obj_class, mapped, cx, cy in inside_objs:
+                    key = obj_class  # Track per-class (simplified)
+                    prev_pos = positions.get(key)
+                    if prev_pos:
+                        dx = abs(cx - prev_pos[0])
+                        dy = abs(cy - prev_pos[1])
+                        if dx < move_threshold and dy < move_threshold:
+                            # Still stationary
+                            if key not in timers:
+                                timers[key] = now
+                            elif now - timers[key] >= stop_limit:
+                                triggered = _build_trigger(obj, obj_class, mapped,
+                                    f"{obj_class} stopped for {int(now - timers[key])}s")
+                                del timers[key]
+                                break
+                        else:
+                            # Moved — reset timer
+                            timers.pop(key, None)
                     else:
-                        trigger_bbox = obj_bbox
-                    return {
-                        "class_name": obj_class,
-                        "event_type": mapped,
-                        "confidence": obj.confidence,
-                        "bbox": trigger_bbox,
-                        "zone_name": zone_name,
-                    }
+                        timers[key] = now
+                    positions[key] = (cx, cy)
+
+                # Clean up positions for objects that left
+                for key in list(positions.keys()):
+                    if not any(oc == key for _, oc, _, _, _ in inside_objs):
+                        positions.pop(key, None)
+                        timers.pop(key, None)
+
+            # ── TAILGATING: rapid successive entries ────────────────
+            elif trigger_type == "tailgating":
+                entry_times = self._zone_entry_times.setdefault(zone_id, [])
+                new_keys = current_keys - prev_keys
+                if new_keys:
+                    entry_times.append(now)
+                # Keep only entries in last 10 seconds
+                entry_times[:] = [t for t in entry_times if now - t < 10]
+                # Tailgating: 3+ entries within 10 seconds
+                if len(entry_times) >= 3 and inside_objs:
+                    obj, obj_class, mapped, _, _ = inside_objs[0]
+                    triggered = _build_trigger(obj, obj_class, mapped,
+                        f"tailgating — {len(entry_times)} entries in 10s")
+                    entry_times.clear()
+
+            # ── DEFAULT: simple presence (legacy behavior) ──────────
+            else:
+                if inside_objs:
+                    obj, obj_class, mapped, _, _ = inside_objs[0]
+                    triggered = _build_trigger(obj, obj_class, mapped, f"{obj_class} detected in zone")
+
+            # Update occupant state for next frame
+            self._zone_occupants[zone_id] = current_keys
+
+            if triggered:
+                # Send notification if enabled
+                if zone.get("notify"):
+                    try:
+                        await notification_service.send(
+                            title=f"🎯 ROI Alert: {zone_name}",
+                            message=f"[{trigger_type.upper()}] {triggered['class_name']} — {zone_name}",
+                            priority="high",
+                        )
+                    except Exception as e:
+                        logger.warning(f"ROI notification failed: {e}")
+                return triggered
 
         return None  # No object triggered any zone
 
@@ -659,7 +851,9 @@ class DetectionWorker:
         self, cam_id: str, event_type: EventType, confidence: float, 
         primary_bbox: BoundingBox, detected_objs: list[DetectedObject], 
         raw_frame: np.ndarray, result, face_id: Optional[str] = None,
-        raw_class_name: Optional[str] = None
+        raw_class_name: Optional[str] = None,
+        camera_name: Optional[str] = None,
+        camera_location: Optional[str] = None
     ):
         """Save snapshot, generate the database event."""
         from app.database import events_collection
@@ -735,6 +929,13 @@ class DetectionWorker:
         )
         
         # 4. Enqueue AI summary for sequential processing
+        # Use camera_name passed from caller, fallback to ID
+        resolved_cam_name = camera_name or cam_id
+
+        # Convert UTC timestamp to IST for display
+        from datetime import timedelta
+        ist_timestamp = now + timedelta(hours=5, minutes=30)
+
         llm_service.enqueue_summary(
             event_oid=event_oid,
             event_type=event_type,
@@ -742,11 +943,19 @@ class DetectionWorker:
             objects=[obj.model_dump(by_alias=True) for obj in detected_objs],
             face_name=face_name,
             snapshot_path=str(snapshot_abs_path),
-        )
-        
-        # 5. Dispatch Notifications (fire and forget)
-        asyncio.create_task(
-            notification_service.dispatch(default_summary, str(snapshot_abs_path))
+            camera_name=resolved_cam_name,
+            camera_location=camera_location or "",
+            timestamp=ist_timestamp,
+            notify_data={
+                "event_type": stored_event_type,
+                "camera_name": resolved_cam_name,
+                "confidence": confidence,
+                "timestamp": ist_timestamp,
+                "detected_objects": [obj.model_dump(by_alias=True) for obj in detected_objs],
+                "bounding_box": primary_bbox.model_dump(),
+                "face_name": face_name,
+                "snapshot_path": str(snapshot_abs_path),
+            },
         )
 
 
@@ -848,9 +1057,9 @@ class DetectionWorker:
 
             for zone in zones:
                 zone_id = str(zone.get("_id", ""))
-                trigger_classes = zone.get("trigger_classes", [])
+                trigger_classes = zone.get("trigger_classes") or []
                 zone_points = zone.get("points", [])
-                if len(zone_points) < 3:
+                if not trigger_classes or len(zone_points) < 3:
                     continue
 
                 # Per-zone cooldown
@@ -1042,17 +1251,39 @@ class DetectionWorker:
         logger.info(f"🚨 [DeepStream] Event: {event_type.value} on cam {cam_id} ({confidence:.2f})")
 
         # Enqueue AI summary for sequential processing
+        ds_camera_name = ""
+        ds_camera_location = ""
+        if jpeg:
+            try:
+                cam_doc = await cameras_collection().find_one({"_id": ObjectId(cam_id)})
+                if cam_doc:
+                    ds_camera_name = cam_doc.get("name", cam_id)
+                    ds_camera_location = cam_doc.get("location", "")
+            except Exception:
+                ds_camera_name = cam_id
+
+        from datetime import timedelta as _td
+        ist_ts = now + _td(hours=5, minutes=30)
+
         llm_service.enqueue_summary(
             event_oid=event_oid,
             event_type=event_type,
             confidence=confidence,
             objects=[obj.model_dump(by_alias=True) for obj in detected_objs],
+            snapshot_path=str(snapshot_abs_path) if jpeg else None,
+            camera_name=ds_camera_name,
+            camera_location=ds_camera_location,
+            timestamp=ist_ts,
+            notify_data={
+                "event_type": event_type.value,
+                "camera_name": ds_camera_name,
+                "confidence": confidence,
+                "timestamp": ist_ts,
+                "detected_objects": [obj.model_dump(by_alias=True) for obj in detected_objs],
+                "bounding_box": primary_bbox.model_dump(),
+                "snapshot_path": str(snapshot_abs_path) if jpeg else None,
+            } if jpeg else None,
         )
-
-        if jpeg:
-            asyncio.create_task(
-                notification_service.dispatch(default_summary, str(snapshot_abs_path))
-            )
 
 
 # Singleton

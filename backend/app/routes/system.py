@@ -180,3 +180,37 @@ async def backfill_event_embeddings(user: dict = Depends(get_current_user)):
         "embedded": embedded,
         "failed": failed,
     }
+
+
+@router.post("/test-email")
+async def test_email_notification(user: dict = Depends(get_current_user)):
+    """Send a test email notification using current email settings."""
+    from datetime import datetime, timezone
+    from app.services.notification_service import notification_service
+
+    event_data = {
+        "event_type": "person",
+        "camera_name": "Test Camera",
+        "confidence": 0.95,
+        "timestamp": datetime.now(timezone.utc),
+        "detected_objects": [{"class": "person", "confidence": 0.95}],
+        "ai_summary": "This is a test notification from Vision Pro NVR. If you received this email, your email notifications are working correctly.",
+        "bounding_box": {"x": 100, "y": 200, "w": 50, "h": 100},
+    }
+    try:
+        settings = await notification_service._get_notification_settings()
+        if not settings.get("email_enabled"):
+            return {"status": "error", "message": "Email notifications are not enabled in settings"}
+        if not settings.get("email_smtp_host"):
+            return {"status": "error", "message": "SMTP host is not configured"}
+
+        await notification_service.send_email(
+            settings,
+            "Test notification from Vision Pro NVR",
+            image_path=None,
+            event_data=event_data,
+        )
+        return {"status": "success", "message": "Test email sent successfully"}
+    except Exception as e:
+        logger.error(f"Test email failed: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}

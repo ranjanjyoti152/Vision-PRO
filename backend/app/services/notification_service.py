@@ -6,10 +6,12 @@ import httpx
 import asyncio
 from typing import Dict, Any, Optional
 from email.message import EmailMessage
+from email.utils import make_msgid
 import aiosmtplib
 
 from app.database import settings_collection
 from app.core.security import decrypt_credential
+from app.services.email_templates import render_event_email
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,11 @@ logger = logging.getLogger(__name__)
 class NotificationService:
     def __init__(self):
         self.timeout = httpx.Timeout(10.0)
+
+    async def send(self, title: str = "", message: str = "", priority: str = "normal", image_path: str = None, event_data: dict = None):
+        """Convenience alias — build a text line and forward to dispatch."""
+        text = f"{title}\n{message}" if title else message
+        await self.dispatch(text, image_path=image_path, event_data=event_data)
 
     async def _get_notification_settings(self) -> Dict[str, Any]:
         """Fetch all notification settings from the database and decrypt keys."""
@@ -34,7 +41,7 @@ class NotificationService:
             settings[key] = value
         return settings
 
-    async def dispatch(self, message: str, image_path: Optional[str] = None):
+    async def dispatch(self, message: str, image_path: Optional[str] = None, event_data: Optional[Dict[str, Any]] = None):
         """Send the alert to all enabled channels concurrently."""
         settings = await self._get_notification_settings()
         tasks = []
@@ -48,7 +55,7 @@ class NotificationService:
             ))
             
         if settings.get("email_enabled") and settings.get("email_smtp_host"):
-            tasks.append(self.send_email(settings, message, image_path))
+            tasks.append(self.send_email(settings, message, image_path, event_data))
             
         if settings.get("whatsapp_enabled") and settings.get("whatsapp_api_url"):
             tasks.append(self.send_whatsapp(settings, message, image_path))
@@ -76,31 +83,61 @@ class NotificationService:
         except Exception as e:
             logger.error(f"Failed to send Telegram notification: {e}")
 
-    async def send_email(self, settings: Dict[str, Any], body: str, image_path: Optional[str] = None):
+    async def send_email(self, settings: Dict[str, Any], body: str, image_path: Optional[str] = None, event_data: Optional[Dict[str, Any]] = None):
         try:
             msg = EmailMessage()
-            msg["Subject"] = "🚨 Vision Pro Security Alert"
+
+            # Build subject from event data if available
+            if event_data:
+                et = event_data.get("event_type", "Event")
+                cam = event_data.get("camera_name", "")
+                subject = f"\U0001F6A8 Vision Pro: {et} detected"
+                if cam:
+                    subject += f" on {cam}"
+            else:
+                subject = "\U0001F6A8 Vision Pro Security Alert"
+
+            msg["Subject"] = subject
             msg["From"] = settings.get("email_from_address", "alerts@visionpro")
             
-            # email_to_addresses might be a list or comma-separated string
             to_addrs = settings.get("email_to_addresses", [])
             if isinstance(to_addrs, list):
                 to_addrs = ", ".join(to_addrs)
             msg["To"] = to_addrs
             
+            # Plain text fallback
             msg.set_content(body)
-            
-            if image_path:
-                import imghdr
+
+            # Render HTML email with event data
+            snapshot_cid = None
+            if event_data:
+                if image_path:
+                    snapshot_cid = make_msgid(domain="visionpro.local")[1:-1]
+                html = render_event_email(event_data, snapshot_cid=snapshot_cid)
+            else:
+                # Fallback: wrap plain text in minimal HTML
+                html = f"<html><body style='background:#0F172A;color:#E5E7EB;padding:20px;font-family:sans-serif;'><p>{body}</p></body></html>"
+
+            msg.add_alternative(html, subtype="html")
+
+            # Attach snapshot inline (referenced by cid in the HTML)
+            if image_path and snapshot_cid:
+                import mimetypes
+                mime_type = mimetypes.guess_type(image_path)[0] or "image/jpeg"
+                maintype, subtype = mime_type.split("/", 1)
                 with open(image_path, "rb") as f:
                     img_data = f.read()
-                img_type = imghdr.what(None, img_data) or "jpeg"
-                msg.add_attachment(img_data, maintype="image", subtype=img_type, filename="snapshot.jpg")
+                # Attach to the HTML alternative part
+                html_part = msg.get_payload()[-1]  # the multipart/alternative's HTML part
+                html_part.add_related(
+                    img_data, maintype=maintype, subtype=subtype,
+                    cid=snapshot_cid, filename="snapshot.jpg"
+                )
                 
             port = int(settings.get("email_smtp_port", 587))
             user = settings.get("email_smtp_user", "")
             password = settings.get("email_smtp_password", "")
-            host = settings.get("email_smtp_host", "")
+            host = settings.get("email_smtp_host", "").strip()
             
             # Basic SMTP send
             await aiosmtplib.send(
